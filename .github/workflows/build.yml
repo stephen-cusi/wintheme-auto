@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # release job 需要创建 Release / 上传产物
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 配置 MSVC 链接环境。
+      # x64 预装在 runner 上；arm64 若缺失，install: true 会用 VS 安装器自动补装
+      # "MSVC v143 - VS 2022 C++ ARM64 生成工具"（GitHub runner 是管理员，可静默安装）。
+      - name: Configure MSVC (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+          install: true
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/wintheme-auto.exe" `
+            "target/${{ matrix.target }}/release/wintheme-auto-${{ matrix.arch }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wintheme-auto-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/wintheme-auto-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true

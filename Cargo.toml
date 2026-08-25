@@ -1,0 +1,24 @@
+[package]
+name = "wintheme-auto"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 11 浅色/深色主题自动切换（跟随日出日落 或 定时），开机启动"
+license = "MIT"
+
+[dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+winreg = "0.52"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

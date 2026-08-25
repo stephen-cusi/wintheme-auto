@@ -1,0 +1,16 @@
+# 构建配置
+#
+# 本项目按标准方式构建即可，无需本文件：
+#   1. 安装 Rust（rustup，ARM64 宿主默认目标 aarch64-pc-windows-msvc）
+#   2. 安装 Visual Studio 2022「ARM64 生成工具」+「Windows 11 SDK」
+#      （提供 link.exe 与 kernel32.lib 等导入库，windows-msvc 目标编译所必需）
+#   3. cargo build --release
+#
+# 如果你确实想用 Rust 自带的 rust-lld 而非 link.exe，可把下面这行取消注释，
+# 并用你本机 toolchain 的真实完整路径替换（rust-lld 不在 PATH 中）：
+#
+# [target.aarch64-pc-windows-msvc]
+# linker = "C:/Users/12/.rustup/toolchains/stable-aarch64-pc-windows-msvc/lib/rustlib/aarch64-pc-windows-msvc/bin/rust-lld.exe"
+#
+# 注意：无论用哪种 linker，都必须安装 Windows SDK / VS 生成工具，
+# 否则 kernel32.lib 等导入库缺失，链接阶段必失败。

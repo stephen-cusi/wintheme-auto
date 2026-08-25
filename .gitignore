@@ -1,0 +1,11 @@
+# Rust 构建产物
+/target
+
+# 本地运行日志（CI 不需要）
+*.log
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
