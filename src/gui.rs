@@ -14,10 +14,9 @@ use chrono::{Local, NaiveTime, Timelike};
 use std::ptr;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, FONT_CHARSET, FONT_WEIGHT, FW_BOLD, GB2312_CHARSET, HFONT,
+    CreateFontW, DeleteObject, FONT_CHARSET, FONT_WEIGHT, FW_BOLD, GB2312_CHARSET, HFONT,
 };
 use windows_sys::Win32::Foundation::HINSTANCE;
-use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject};
 use windows_sys::Win32::System::SystemServices::{
     SS_CENTER, SS_ICON, SS_LEFT,
 };
@@ -83,11 +82,11 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         0,
         0,
         0,
-        FW_BOLD,
+        FW_BOLD as i32,
         0,
         0,
         0,
-        GB2312_CHARSET,
+        GB2312_CHARSET as u32,
         0,
         0,
         0,
@@ -148,7 +147,6 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
         SetWindowLongPtrW(parent, raw::GWLP_USERDATA, big_font as isize);
     }
-    parent
 }
 
 unsafe fn make_static(
@@ -174,7 +172,7 @@ unsafe fn make_static(
         cx,
         cy,
         parent,
-        id as *mut _,
+        id as isize,
         hinst,
         ptr::null(),
     )
@@ -191,9 +189,7 @@ unsafe fn make_button(
     text: &str,
 ) -> HWND {
     let t = w(text);
-    let s = 
-        raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_PUSHBUTTON as u32,
-    ;
+    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_PUSHBUTTON as u32;
     CreateWindowExW(
         0,
         w("BUTTON").as_ptr(),
@@ -204,7 +200,7 @@ unsafe fn make_button(
         cx,
         cy,
         parent,
-        id as *mut _,
+        id as isize,
         hinst,
         ptr::null(),
     )
@@ -219,11 +215,11 @@ unsafe fn make_edit(
     cx: i32,
     cy: i32,
 ) -> HWND {
-    let s = 
-        raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP
-            | ES_AUTOHSCROLL as u32
-            | ES_NUMBER as u32,
-    ;
+    let s = raw::WS_CHILD
+        | raw::WS_VISIBLE
+        | raw::WS_TABSTOP
+        | ES_AUTOHSCROLL as u32
+        | ES_NUMBER as u32;
     CreateWindowExW(
         raw::WS_EX_CLIENTEDGE,
         w("EDIT").as_ptr(),
@@ -234,7 +230,7 @@ unsafe fn make_edit(
         cx,
         cy,
         parent,
-        id as *mut _,
+        id as isize,
         hinst,
         ptr::null(),
     )

@@ -5,7 +5,7 @@
 // 我们用 Pillow 默认输出的 BMP 帧，兼容性最好。
 
 use std::sync::OnceLock;
-use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconFromResourceEx, HICON, IMAGE_FLAGS};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconFromResourceEx, HICON};
 
 /// 嵌入的 .ico 文件（多个尺寸，包含 16/24/32/48/64/128/256）
 static ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");

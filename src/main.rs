@@ -21,8 +21,9 @@ use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     ShellExecuteW, Shell_NotifyIconW,
 };
+use windows_sys::Win32::Graphics::Gdi::DeleteObject;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DeleteObject,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW,
     DestroyMenu, DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, LoadCursorW,
     LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
@@ -184,7 +185,6 @@ fn run_tray_only() -> anyhow::Result<()> {
 
 fn run_event_loop() -> anyhow::Result<()> {
     unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WINDOW_STYLE};
         let hinst = GetModuleHandleW(ptr::null());
         let class_name = widestring("WinthemeAutoClass");
         let title = widestring("WinTheme Auto");
@@ -207,9 +207,9 @@ fn run_event_loop() -> anyhow::Result<()> {
                 | 0x04000000  // WS_CLIPSIBLINGS
                 | 0x10000000; // WS_VISIBLE
             (
-                WINDOW_STYLE(style_bits),
-                WINDOW_EX_STYLE(0x00040000), // WS_EX_APPWINDOW
-                ptr::null_mut(),
+                style_bits,
+                0x00040000, // WS_EX_APPWINDOW
+                0,          // 无父窗口（HWND 是 isize，空句柄传 0）
                 gui::WIN_W,
                 gui::WIN_H,
             )
