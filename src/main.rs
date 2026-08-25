@@ -2,6 +2,8 @@
 
 mod config;
 mod geo;
+mod gui;
+mod icon;
 mod sun;
 mod theme;
 
@@ -20,12 +22,12 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu,
-    DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DeleteObject,
+    DestroyMenu, DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, LoadCursorW,
     LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CREATE, WM_DESTROY,
-    WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
 };
 
 use crate::config::Config;
@@ -131,10 +133,12 @@ fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow!("APP_STATE 已初始化"))?;
 
     let use_tray = APP_STATE.get().unwrap().lock().unwrap().cfg.tray;
-    if use_tray {
-        run_tray()?;
+    if args.iter().any(|a| a == "--tray-only") {
+        // 仅托盘模式（保留旧行为）
+        run_tray_only()?;
     } else {
-        run_headless()?;
+        // 默认：标准 GUI 主窗口 + 系统托盘
+        run_gui()?;
     }
     Ok(())
 }
@@ -161,16 +165,29 @@ fn run_headless() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// 主循环：系统托盘模式
+// 主循环：标准 GUI 模式（默认）—— 打开就有主窗口 + 系统托盘
 // ---------------------------------------------------------------------------
 
-fn run_tray() -> anyhow::Result<()> {
+fn run_gui() -> anyhow::Result<()> {
+    IS_MAIN_WINDOW.store(true, Ordering::Relaxed);
+    run_event_loop()
+}
+
+// ---------------------------------------------------------------------------
+// 主循环：仅托盘模式（旧行为）—— HWND_MESSAGE 隐藏窗口 + 系统托盘
+// ---------------------------------------------------------------------------
+
+fn run_tray_only() -> anyhow::Result<()> {
+    IS_MAIN_WINDOW.store(false, Ordering::Relaxed);
+    run_event_loop()
+}
+
+fn run_event_loop() -> anyhow::Result<()> {
     unsafe {
-        // 注意：windows-sys 0.52 的句柄（HWND/HINSTANCE/HMENU 等）是 isize 整数，不是指针。
-        // 传"空句柄"用 0，传空指针参数用 ptr::null()。
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WINDOW_STYLE};
         let hinst = GetModuleHandleW(ptr::null());
         let class_name = widestring("WinthemeAutoClass");
-        let title = widestring("WinthemeAuto");
+        let title = widestring("WinTheme Auto");
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wnd_proc);
         wc.hInstance = hinst;
@@ -179,19 +196,45 @@ fn run_tray() -> anyhow::Result<()> {
         if RegisterClassW(&wc) == 0 {
             log("RegisterClassW 失败");
         }
+        let is_main = IS_MAIN_WINDOW.load(Ordering::Relaxed);
+        // 主窗口：OVERLAPPEDWINDOW 风格（标题栏/系统菜单/最小化按钮）+ 可见
+        // 仅托盘：HWND_MESSAGE 隐藏窗口
+        let (style, ex_style, parent, w, h) = if is_main {
+            let style_bits: u32 = 0x00C00000 // WS_OVERLAPPED | WS_CAPTION
+                | 0x00080000  // WS_SYSMENU
+                | 0x00020000  // WS_MINIMIZEBOX
+                | 0x02000000  // WS_CLIPCHILDREN
+                | 0x04000000  // WS_CLIPSIBLINGS
+                | 0x10000000; // WS_VISIBLE
+            (
+                WINDOW_STYLE(style_bits),
+                WINDOW_EX_STYLE(0x00040000), // WS_EX_APPWINDOW
+                ptr::null_mut(),
+                gui::WIN_W,
+                gui::WIN_H,
+            )
+        } else {
+            (
+                WINDOW_STYLE(0),
+                WINDOW_EX_STYLE(0),
+                HWND_MESSAGE,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+            )
+        };
         let hwnd = CreateWindowExW(
-            0,
+            ex_style,
             class_name.as_ptr(),
             title.as_ptr(),
+            style,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            w,
+            h,
+            parent,
             0,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            HWND_MESSAGE,
-            0, // hMenu（isize）
             hinst,
-            ptr::null(), // lpParam: *const c_void
+            ptr::null(),
         );
         if hwnd == 0 {
             log("创建窗口失败，回退到无托盘模式");
@@ -228,6 +271,11 @@ unsafe extern "system" fn wnd_proc(
                 .map(|s| s.lock().unwrap().cfg.check_interval_secs)
                 .unwrap_or(60);
             SetTimer(hwnd, 1, ((secs * 1000).max(1000)) as u32, None);
+            // 主窗口模式：在已创建的主窗口上填充 GUI 控件
+            if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+                let hinst = GetModuleHandleW(ptr::null());
+                gui::populate_main_window(hwnd, hinst);
+            }
             if let Some(s) = APP_STATE.get() {
                 if let Ok(mut st) = s.lock() {
                     if let Err(e) = tick(&mut st) {
@@ -236,6 +284,7 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             update_tooltip(hwnd);
+            refresh_ui(hwnd);
             0
         }
         // 后台定位完成后触发：立即重新评估并刷新托盘提示
@@ -248,6 +297,7 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             update_tooltip(hwnd);
+            refresh_ui(hwnd);
             0
         }
         WM_TIMER => {
@@ -258,24 +308,140 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
             }
+            refresh_ui(hwnd);
             0
         }
         WM_TRAY => {
             let event = lparam as u32;
             match event {
-                WM_LBUTTONUP => handle_menu_cmd(hwnd, ID_TOGGLE),
+                WM_LBUTTONUP => {
+                    if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+                        // 主窗口模式：左键 = 显示/隐藏主窗口
+                        show_or_toggle_main_window(hwnd);
+                    } else {
+                        handle_menu_cmd(hwnd, ID_TOGGLE);
+                    }
+                }
                 WM_RBUTTONUP => show_menu(hwnd),
                 _ => {}
             }
             0
         }
+        WM_COMMAND => {
+            // 主窗口按钮命令分发
+            let id = (_wparam as u32) & 0xFFFF;
+            match id {
+                gui::ID_BTN_TOGGLE => handle_menu_cmd(hwnd, ID_TOGGLE),
+                gui::ID_BTN_CHECK => handle_menu_cmd(hwnd, ID_CHECK),
+                gui::ID_BTN_OPEN_CFG => handle_menu_cmd(hwnd, ID_CONFIG),
+                gui::ID_BTN_HIDE => {
+                    ShowWindow(hwnd, SW_HIDE);
+                    log("主窗口已隐藏到托盘");
+                }
+                gui::ID_BTN_EXIT => {
+                    PostQuitMessage(0);
+                }
+                gui::ID_BTN_CYCLE_MODE => {
+                    // 循环切换模式：sun -> schedule -> off -> sun
+                    if let Some(s) = APP_STATE.get() {
+                        let mut st = s.lock().unwrap();
+                        st.cfg.mode = match st.cfg.mode.as_str() {
+                            "sun" => "schedule".into(),
+                            "schedule" => "off".into(),
+                            _ => "sun".into(),
+                        };
+                        let new_mode = st.cfg.mode.clone();
+                        let _ = config::save(&st.cfg);
+                        log(&format!("模式 -> {}", new_mode));
+                        drop(st);
+                        refresh_ui(hwnd);
+                    }
+                }
+                gui::ID_BTN_SAVE_TIME => {
+                    save_schedule_time_from_edits(hwnd);
+                    refresh_ui(hwnd);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            // 主窗口：关闭按钮 = 隐藏到托盘（不退出）
+            ShowWindow(hwnd, SW_HIDE);
+            log("主窗口已隐藏到托盘（关闭窗口 = 隐藏，并未退出）");
+            0
+        }
         WM_DESTROY => {
+            // 清理：托盘 +字体
             let mut nid = nid_base(hwnd);
             Shell_NotifyIconW(NIM_DELETE, &mut nid);
+            if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+                use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
+                let font = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as isize;
+                if font != 0 {
+                    DeleteObject(font);
+                }
+            }
             PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(hwnd, msg, _wparam, lparam),
+    }
+}
+
+// ---- 主窗口辅助 ----
+
+static IS_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
+const GWLP_USERDATA: i32 = -21;
+
+/// 刷新 UI（托盘提示 + 主窗口）
+unsafe fn refresh_ui(hwnd: HWND) {
+    update_tooltip(hwnd);
+    if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+        gui::refresh_main_window(hwnd);
+    }
+}
+
+/// 左键托盘：显示/隐藏主窗口
+unsafe fn show_or_toggle_main_window(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    if IsWindowVisible(hwnd) != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+        refresh_ui(hwnd);
+    }
+}
+
+/// 把主窗口编辑框里的 light_time/dark_time 写回配置
+unsafe fn save_schedule_time_from_edits(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem;
+    let light_h = GetDlgItem(hwnd, gui::ID_EDIT_LIGHT as i32);
+    let dark_h = GetDlgItem(hwnd, gui::ID_EDIT_DARK as i32);
+    if light_h.is_null() || dark_h.is_null() {
+        return;
+    }
+    let mut buf1 = [0u16; 16];
+    let mut buf2 = [0u16; 16];
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let n1 = GetWindowTextW(light_h, buf1.as_mut_ptr(), 16);
+    let n2 = GetWindowTextW(dark_h, buf2.as_mut_ptr(), 16);
+    if n1 == 0 || n2 == 0 {
+        log("时间保存失败：读取编辑框内容为空");
+        return;
+    }
+    let s1 = String::from_utf16_lossy(&buf1[..n1 as usize]);
+    let s2 = String::from_utf16_lossy(&buf2[..n2 as usize]);
+    if let Some(s) = APP_STATE.get() {
+        let mut st = s.lock().unwrap();
+        st.cfg.light_time = s1.trim().to_string();
+        st.cfg.dark_time = s2.trim().to_string();
+        let _ = config::save(&st.cfg);
+        log(&format!(
+            "时间已保存：浅色 {} 深色 {}",
+            st.cfg.light_time, st.cfg.dark_time
+        ));
     }
 }
 
@@ -429,8 +595,17 @@ unsafe fn nid_base(hwnd: HWND) -> NOTIFYICONDATAW {
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(0, IDI_APPLICATION);
+    nid.hIcon = tray_hicon();
     nid
+}
+
+/// 首次调用时加载并缓存托盘 HICON（16x16）。
+/// 注意：进程退出时不主动 DestroyIcon——Windows 会自动清理；显式 DestroyIcon
+/// 需要 HICON 是可变，且要保证不与之后 nid_base 的缓存句柄冲突。
+fn tray_hicon() -> isize {
+    use std::sync::OnceLock;
+    static ICON: OnceLock<isize> = OnceLock::new();
+    *ICON.get_or_init(|| unsafe { icon::load_icon(16) })
 }
 
 unsafe fn update_tooltip(hwnd: HWND) {
