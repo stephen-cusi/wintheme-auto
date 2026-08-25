@@ -8,11 +8,13 @@ mod theme;
 use anyhow::anyhow;
 use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, WPARAM};
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     ShellExecuteW, Shell_NotifyIconW,
@@ -20,10 +22,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu,
     DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
-    LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TranslateMessage, DispatchMessageW, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, HWND_MESSAGE,
+    LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CREATE, WM_DESTROY,
+    WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
 };
 
 use crate::config::Config;
@@ -43,14 +45,22 @@ const ID_EXIT: u32 = 1009;
 const TRAY_ICON_ID: u32 = 1;
 // windows-sys 0.52 没有 UINT 类型，消息类型直接用 u32（WNDPROC 签名即 u32）
 const WM_TRAY: u32 = WM_APP + 1;
+/// 后台定位完成后通知主线程立即刷新
+const MSG_REFRESH: u32 = WM_APP + 2;
 
 static APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
+/// --console 模式：不隐藏控制台，log() 同时输出到 stdout
+static CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
 
 struct AppState {
     cfg: Config,
     sun_cache_date: Option<NaiveDate>,
     sun_cache: Option<SunTimes>,
     coords: Option<(f64, f64)>,
+    /// 是否正在后台获取地理位置（防止重复发起请求）
+    fetching_coords: bool,
+    /// 托盘窗口句柄，用于后台线程发消息通知刷新
+    tray_hwnd: Option<HWND>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -84,6 +94,20 @@ fn main() -> anyhow::Result<()> {
         println!("已写入开机启动注册表项，程序将在登录时自动运行。");
     }
 
+    // --console：终端运行时不隐藏控制台，日志实时打到 stdout（便于观察）
+    CONSOLE_MODE.store(args.iter().any(|a| a == "--console"), Ordering::Relaxed);
+
+    // 单实例：已有常驻实例在跑时直接退出（避免双托盘/多进程困惑）。
+    // CreateMutexW 返回 0 且错误码 183(ERROR_ALREADY_EXISTS) 表示锁已被占用。
+    unsafe {
+        let mutex_name = widestring("Local\\WinThemeAuto-SingleInstance");
+        let m = CreateMutexW(ptr::null(), 1, mutex_name.as_ptr());
+        if m == 0 && std::io::Error::last_os_error().raw_os_error() == Some(183) {
+            eprintln!("wintheme-auto 已在运行（托盘常驻）。如需重启，请先从托盘菜单退出旧实例。");
+            std::process::exit(0);
+        }
+    }
+
     let cfg = config::load()?;
     if cfg.auto_start && !args.iter().any(|a| a == "--no-autostart") {
         let _ = config::install_startup(&exe);
@@ -99,6 +123,8 @@ fn main() -> anyhow::Result<()> {
         sun_cache_date: None,
         sun_cache: None,
         coords: None,
+        fetching_coords: false,
+        tray_hwnd: None,
     };
     APP_STATE
         .set(Arc::new(Mutex::new(state)))
@@ -192,11 +218,28 @@ unsafe extern "system" fn wnd_proc(
         WM_CREATE => {
             let mut nid = nid_base(hwnd);
             Shell_NotifyIconW(NIM_ADD, &mut nid);
+            if let Some(s) = APP_STATE.get() {
+                if let Ok(mut st) = s.lock() {
+                    st.tray_hwnd = Some(hwnd);
+                }
+            }
             let secs = APP_STATE
                 .get()
                 .map(|s| s.lock().unwrap().cfg.check_interval_secs)
                 .unwrap_or(60);
             SetTimer(hwnd, 1, ((secs * 1000).max(1000)) as u32, None);
+            if let Some(s) = APP_STATE.get() {
+                if let Ok(mut st) = s.lock() {
+                    if let Err(e) = tick(&mut st) {
+                        log(&format!("tick 错误: {e}"));
+                    }
+                }
+            }
+            update_tooltip(hwnd);
+            0
+        }
+        // 后台定位完成后触发：立即重新评估并刷新托盘提示
+        MSG_REFRESH => {
             if let Some(s) = APP_STATE.get() {
                 if let Ok(mut st) = s.lock() {
                     if let Err(e) = tick(&mut st) {
@@ -499,11 +542,35 @@ fn ensure_coords(state: &mut AppState) -> anyhow::Result<(f64, f64)> {
         let _ = write_coords_cache(c);
         return Ok(c);
     }
-    log("正在通过 IP 获取地理位置...");
-    let c = geo::fetch_location()?;
-    state.coords = Some(c);
-    let _ = write_coords_cache(c);
-    Ok(c)
+    // 没有可用坐标：放到后台线程去获取，绝不阻塞 UI / 主循环。
+    if state.fetching_coords {
+        return Err(anyhow!("正在后台获取地理位置，本次跳过"));
+    }
+    state.fetching_coords = true;
+    log("正在后台获取地理位置...");
+    let app = APP_STATE.get().unwrap().clone();
+    std::thread::spawn(move || {
+        let result = geo::fetch_location();
+        let mut st = app.lock().unwrap();
+        match result {
+            Ok(c) => {
+                st.coords = Some(c);
+                let _ = write_coords_cache(c);
+                log(&format!("地理位置获取成功: {:.4},{:.4}", c.0, c.1));
+                // 通知主线程立即刷新（不等待下一个定时 tick）
+                if let Some(hwnd) = st.tray_hwnd {
+                    unsafe {
+                        PostMessageW(hwnd, MSG_REFRESH, 0, 0);
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("地理位置获取失败: {e}（将按当前配置继续，稍后自动重试）"));
+            }
+        }
+        st.fetching_coords = false;
+    });
+    Err(anyhow!("正在后台获取地理位置..."))
 }
 
 fn read_coords_cache() -> anyhow::Result<Option<(f64, f64)>> {
@@ -554,6 +621,9 @@ unsafe fn hide_console() {
 }
 
 fn log(msg: &str) {
+    if CONSOLE_MODE.load(Ordering::Relaxed) {
+        println!("[wintheme-auto] {msg}");
+    }
     let dir = config::config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("wintheme-auto.log");

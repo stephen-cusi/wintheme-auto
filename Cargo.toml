@@ -14,6 +14,9 @@ windows-sys = { version = "0.52", features = [
     # WNDCLASSW / RegisterClassW 需要 Gdi；GetConsoleWindow 需要 System_Console
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
+    # 单实例互斥：CreateMutexW
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
 winreg = "0.52"
 chrono = "0.4"
