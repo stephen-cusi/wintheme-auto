@@ -31,14 +31,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # 配置 MSVC 链接环境。
-      # x64 预装在 runner 上；arm64 若缺失，install: true 会用 VS 安装器自动补装
-      # "MSVC v143 - VS 2022 C++ ARM64 生成工具"（GitHub runner 是管理员，可静默安装）。
+      # 配置 MSVC 链接环境。x64 预装在 runner 上；arm64 生成工具在 windows-latest
+      # 镜像中已预装（GitHub 自 2024 年起提供），无需手动安装。
+      # 若 arm64 链接报缺 ARM64 库，可改用 cargo-xwin 交叉编译方案。
       - name: Configure MSVC (${{ matrix.msvc_arch }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.msvc_arch }}
-          install: true
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
