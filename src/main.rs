@@ -976,17 +976,19 @@ unsafe fn get_window_rect_content(hwnd: HWND) -> RECT {
 /// "关于"对话框自绘文字
 unsafe fn paint_about(hwnd: HWND) {
     use windows_sys::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, DrawTextW, SetBkMode, SetTextColor, PAINTSTRUCT,
+        BeginPaint, EndPaint, DrawTextW, FillRect, SetBkMode, SetTextColor, PAINTSTRUCT,
     };
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     if hdc == 0 {
         return;
     }
+    let rc = get_window_rect_content(hwnd);
+    // 显式按主题填充背景，否则 BEGINPAINT 可能不清屏，导致黑底 + 深色字不可见
+    FillRect(hdc, &rc, win_brush());
     let version = env!("CARGO_PKG_VERSION");
     // 文字：先居中标题("WinTheme Auto")，再列各字段
     let title_w = widestring(&format!("WinTheme Auto v{version}"));
-    let mut rc = get_window_rect_content(hwnd);
     let mut title_rc = rc;
     title_rc.left += 16;
     title_rc.right -= 16;
