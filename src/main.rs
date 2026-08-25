@@ -1,3 +1,6 @@
+// GUI 子系统：双击 exe 不会再弹出黑屏 cmd 窗口（真正的前台窗口程序）。
+// CLI 命令与 --console 模式通过 AllocConsole / AttachConsole 仍可输出到终端。
+#![windows_subsystem = "windows"]
 #![allow(dead_code)]
 
 mod config;
@@ -13,20 +16,31 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, WPARAM};
-use windows_sys::Win32::System::Console::GetConsoleWindow;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, WPARAM};
+use windows_sys::core::PCSTR;
+use windows_sys::Win32::System::Console::{
+    AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
+};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleW, GetProcAddress, LoadLibraryW,
+};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     ShellExecuteW, Shell_NotifyIconW,
 };
-use windows_sys::Win32::Graphics::Gdi::DeleteObject;
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SetBkColor, SetBkMode, SetTextColor,
+};
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW,
-    DestroyMenu, DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, LoadCursorW,
-    LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
+    DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW,
+    HMENU, IDC_ARROW, LoadCursorW, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE,
+    SW_SHOWNORMAL, TrackPopupMenu,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
 };
@@ -67,10 +81,27 @@ struct AppState {
 }
 
 fn main() -> anyhow::Result<()> {
+    // 声明 PerMonitorV2 DPI 感知：高分屏（如 200%）下保持清晰，避免系统位图拉伸导致模糊。
+    // 必须在创建任何窗口之前调用。
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        enable_dark_mode();
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
 
-    // 一次性命令（带 -- 前缀的都视为命令行调用，不隐藏控制台）
+    // GUI 子系统下默认不弹出控制台；--console 自建控制台，其他命令尝试挂到父控制台。
+    let console_args = args.iter().any(|a| a == "--console");
+    if console_args {
+        unsafe { AllocConsole() };
+        CONSOLE_MODE.store(true, Ordering::Relaxed);
+    } else {
+        // 使 CLI 命令在终端里的 println! 输出可见（双击无父控制台则失败并忽略）
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+
+    // 一次性命令（带 -- 前缀的都视为命令行调用）
     if args.iter().any(|a| a == "--light") {
         theme::set_theme(Theme::Light)?;
         return Ok(());
@@ -81,44 +112,45 @@ fn main() -> anyhow::Result<()> {
     }
     if args.iter().any(|a| a == "--uninstall") {
         config::uninstall_startup()?;
-        println!("已移除开机启动注册表项。");
+        emit("已移除开机启动注册表项。");
         return Ok(());
     }
     if args.iter().any(|a| a == "--status") {
         let t = theme::get_theme()
             .map(|t| if t == Theme::Light { "浅色(light)" } else { "深色(dark)" })
             .unwrap_or("未知");
-        println!("当前主题: {}", t);
+        emit(&format!("当前主题: {}", t));
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--install") {
         config::install_startup(&exe)?;
-        println!("已写入开机启动注册表项，程序将在登录时自动运行。");
+        emit("已写入开机启动注册表项，程序将在登录时自动运行。");
     }
 
-    // --console：终端运行时不隐藏控制台，日志实时打到 stdout（便于观察）
-    CONSOLE_MODE.store(args.iter().any(|a| a == "--console"), Ordering::Relaxed);
-
-    // 单实例：已有常驻实例在跑时直接退出（避免双托盘/多进程困惑）。
-    // CreateMutexW 返回 0 且错误码 183(ERROR_ALREADY_EXISTS) 表示锁已被占用。
+    // 单实例：互斥体已存在（错误码 183 = ERROR_ALREADY_EXISTS）即说明已有实例在运行。
+    // 注意：CreateMutexW 在已存在时会返回一个有效句柄并置 last_error=183，不能用“返回 0”判断。
     unsafe {
         let mutex_name = widestring("Local\\WinThemeAuto-SingleInstance");
-        let m = CreateMutexW(ptr::null(), 1, mutex_name.as_ptr());
-        if m == 0 && std::io::Error::last_os_error().raw_os_error() == Some(183) {
-            eprintln!("wintheme-auto 已在运行（托盘常驻）。如需重启，请先从托盘菜单退出旧实例。");
+        let held = CreateMutexW(ptr::null(), 1, mutex_name.as_ptr());
+        if std::io::Error::last_os_error().raw_os_error() == Some(183) {
+            // 已有实例在运行：弹窗提示后退出
+            let msg = widestring(
+                "WinTheme Auto 已在运行，请勿重复打开。\n如需重启，请先从系统托盘退出旧实例。",
+            );
+            let cap = widestring("WinTheme Auto");
+            const MB_ICONINFORMATION: u32 = 0x40;
+            const MB_OK: u32 = 0x0;
+            MessageBoxW(0, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
             std::process::exit(0);
         }
+        // 保持 held 句柄在进程生命周期内不释放，作为单实例锁
+        std::mem::forget(held);
     }
 
     let cfg = config::load()?;
     if cfg.auto_start && !args.iter().any(|a| a == "--no-autostart") {
         let _ = config::install_startup(&exe);
-    }
-
-    // 普通运行（无 -- 命令行参数）时隐藏控制台窗口
-    if !args.iter().skip(1).any(|a| a.starts_with("--")) {
-        unsafe { hide_console() };
     }
 
     let state = AppState {
@@ -133,7 +165,6 @@ fn main() -> anyhow::Result<()> {
         .set(Arc::new(Mutex::new(state)))
         .map_err(|_| anyhow!("APP_STATE 已初始化"))?;
 
-    let use_tray = APP_STATE.get().unwrap().lock().unwrap().cfg.tray;
     if args.iter().any(|a| a == "--tray-only") {
         // 仅托盘模式（保留旧行为）
         run_tray_only()?;
@@ -193,6 +224,7 @@ fn run_event_loop() -> anyhow::Result<()> {
         wc.hInstance = hinst;
         wc.lpszClassName = class_name.as_ptr();
         wc.hCursor = LoadCursorW(0, IDC_ARROW);
+        wc.hbrBackground = win_brush() as _;
         if RegisterClassW(&wc) == 0 {
             log("RegisterClassW 失败");
         }
@@ -206,12 +238,15 @@ fn run_event_loop() -> anyhow::Result<()> {
                 | 0x02000000  // WS_CLIPCHILDREN
                 | 0x04000000  // WS_CLIPSIBLINGS
                 | 0x10000000; // WS_VISIBLE
+            let k = gui::dpi_scale_for_system();
+            let win_w = (gui::BASE_W as f64 * k).round() as i32;
+            let win_h = (gui::BASE_H as f64 * k).round() as i32;
             (
                 style_bits,
                 0x00040000, // WS_EX_APPWINDOW
                 0,          // 无父窗口（HWND 是 isize，空句柄传 0）
-                gui::WIN_W,
-                gui::WIN_H,
+                win_w,
+                win_h,
             )
         } else {
             (
@@ -274,7 +309,10 @@ unsafe extern "system" fn wnd_proc(
             // 主窗口模式：在已创建的主窗口上填充 GUI 控件
             if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
                 let hinst = GetModuleHandleW(ptr::null());
+                allow_dark_window(hwnd);
                 gui::populate_main_window(hwnd, hinst);
+                // 设置标题栏 / 任务栏图标（用我们自定义的 .ico，而非默认图标）
+                apply_app_icon(hwnd);
             }
             if let Some(s) = APP_STATE.get() {
                 if let Ok(mut st) = s.lock() {
@@ -286,6 +324,30 @@ unsafe extern "system" fn wnd_proc(
             update_tooltip(hwnd);
             refresh_ui(hwnd);
             0
+        }
+        // 静态文本：与应用主题一致（去掉灰底矩形，文字同主题）
+        0x0138 => { // WM_CTLCOLORSTATIC
+            let hdc = _wparam as isize;
+            SetBkMode(hdc, 2); // OPAQUE
+            SetBkColor(hdc, bg_color());
+            SetTextColor(hdc, text_color());
+            win_brush()
+        }
+        // 输入框：与应用主题一致
+        0x0133 => { // WM_CTLCOLOREDIT
+            let hdc = _wparam as isize;
+            SetBkMode(hdc, 2); // OPAQUE
+            SetBkColor(hdc, edit_color());
+            SetTextColor(hdc, edit_text_color());
+            edit_brush()
+        }
+        // 窗口背景擦除：与应用主题一致的背景
+        0x0014 => { // WM_ERASEBKGND
+            let hdc = _wparam as isize;
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(hdc, &rc, win_brush());
+            1
         }
         // 后台定位完成后触发：立即重新评估并刷新托盘提示
         MSG_REFRESH => {
@@ -331,8 +393,16 @@ unsafe extern "system" fn wnd_proc(
             // 主窗口按钮命令分发
             let id = (_wparam as u32) & 0xFFFF;
             match id {
-                gui::ID_BTN_TOGGLE => handle_menu_cmd(hwnd, ID_TOGGLE),
-                gui::ID_BTN_CHECK => handle_menu_cmd(hwnd, ID_CHECK),
+                gui::ID_BTN_TOGGLE => {
+                    handle_menu_cmd(hwnd, ID_TOGGLE);
+                    refresh_ui(hwnd);
+                }
+                gui::ID_BTN_CHECK => {
+                    // 立即检查：重新评估主题；刷新信息行让结果可见。
+                    // 若坐标未知会触发后台定位，标签会显示“正在后台获取...”。
+                    handle_menu_cmd(hwnd, ID_CHECK);
+                    refresh_ui(hwnd);
+                }
                 gui::ID_BTN_OPEN_CFG => handle_menu_cmd(hwnd, ID_CONFIG),
                 gui::ID_BTN_HIDE => {
                     ShowWindow(hwnd, SW_HIDE);
@@ -360,6 +430,13 @@ unsafe extern "system" fn wnd_proc(
                 gui::ID_BTN_SAVE_TIME => {
                     save_schedule_time_from_edits(hwnd);
                     refresh_ui(hwnd);
+                }
+                gui::ID_CHK_AUTOSTART => {
+                    if ((_wparam >> 16) as u32) == 0 {
+                        // BN_CLICKED：切换开机自启
+                        on_autostart_clicked(hwnd);
+                        refresh_ui(hwnd);
+                    }
                 }
                 _ => {}
             }
@@ -394,12 +471,160 @@ unsafe extern "system" fn wnd_proc(
 static IS_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
 const GWLP_USERDATA: i32 = -21;
 
+// ---- 界面配色：由应用自己的主题判断（is_dark）决定，深浅色各一套，保证可读且一致 ----
+const BG_LIGHT: u32 = 0x00F2F2F2; // 浅色窗口背景
+const TEXT_LIGHT: u32 = 0x001E1E1E; // 浅色正文
+const EDIT_LIGHT: u32 = 0x00FFFFFF; // 浅色输入框
+const BG_DARK: u32 = 0x001F1F1F; // 深色窗口背景
+const TEXT_DARK: u32 = 0x00E8E8E8; // 深色正文
+const EDIT_DARK: u32 = 0x002D2D2D; // 深色输入框（略亮于背景，便于辨认）
+
+/// 当前是否为深色主题（跟应用切换的主题一致）。
+fn is_dark() -> bool {
+    theme::get_theme().map(|t| t == Theme::Dark).unwrap_or(false)
+}
+
+fn bg_color() -> u32 {
+    if is_dark() { BG_DARK } else { BG_LIGHT }
+}
+fn text_color() -> u32 {
+    if is_dark() { TEXT_DARK } else { TEXT_LIGHT }
+}
+fn edit_color() -> u32 {
+    if is_dark() { EDIT_DARK } else { EDIT_LIGHT }
+}
+fn edit_text_color() -> u32 {
+    if is_dark() { TEXT_DARK } else { TEXT_LIGHT }
+}
+
+/// 按主题缓存的窗口画刷。
+fn win_brush() -> isize {
+    static L: OnceLock<isize> = OnceLock::new();
+    static D: OnceLock<isize> = OnceLock::new();
+    if is_dark() {
+        *D.get_or_init(|| unsafe { CreateSolidBrush(BG_DARK) })
+    } else {
+        *L.get_or_init(|| unsafe { CreateSolidBrush(BG_LIGHT) })
+    }
+}
+
+/// 按主题缓存的输入框画刷。
+fn edit_brush() -> isize {
+    static L: OnceLock<isize> = OnceLock::new();
+    static D: OnceLock<isize> = OnceLock::new();
+    if is_dark() {
+        *D.get_or_init(|| unsafe { CreateSolidBrush(EDIT_DARK) })
+    } else {
+        *L.get_or_init(|| unsafe { CreateSolidBrush(EDIT_LIGHT) })
+    }
+}
+
+/// 给主窗口设置自定义标题栏 / 任务栏图标（大小随 DPI 缩放，避免高分屏下模糊）。
+unsafe fn apply_app_icon(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    let k = gui::dpi_scale_for_system();
+    let small = icon::load_icon((16.0 * k).round() as i32);
+    let big = icon::load_icon((32.0 * k).round() as i32);
+    // wParam = 图标类型，lParam = HICON
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small);
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, big);
+}
+
+/// 让标题栏跟随当前主题（深色标题栏 / 浅色标题栏）。
+unsafe fn apply_titlebar_theme(hwnd: HWND) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    let dark: i32 = if is_dark() { 1 } else { 0 };
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const i32 as *const std::ffi::c_void,
+        std::mem::size_of::<i32>() as u32,
+    );
+}
+
+// ---- 让系统通用控件跟随深色模式（未公开 API，失败则静默保持现状）----
+
+/// 进程启动时调用一次：告诉系统该应用“允许深色模式”（通用控件/菜单才会跟随主题）。
+unsafe fn enable_dark_mode() {
+    type SetPreferredAppMode = unsafe extern "system" fn(u32) -> u32;
+    let dll = LoadLibraryW(widestring("uxtheme.dll").as_ptr());
+    if dll == 0 {
+        return;
+    }
+    let proc = GetProcAddress(dll, b"SetPreferredAppMode\0".as_ptr() as PCSTR);
+    if let Some(base) = proc {
+        let f: SetPreferredAppMode = std::mem::transmute(base);
+        f(1); // PreferredAppMode::AllowDark
+    }
+}
+
+/// 让指定窗口的深色模式生效（AllowDarkModeForWindow）。
+unsafe fn allow_dark_window(hwnd: HWND) {
+    type AllowDark = unsafe extern "system" fn(isize, u32) -> u32;
+    let dll = LoadLibraryW(widestring("uxtheme.dll").as_ptr());
+    if dll == 0 {
+        return;
+    }
+    let proc = GetProcAddress(dll, b"AllowDarkModeForWindow\0".as_ptr() as PCSTR);
+    if let Some(base) = proc {
+        let f: AllowDark = std::mem::transmute(base);
+        f(hwnd, 1);
+    }
+}
+
+// ---- 控制台输出 ----
+// GUI 子系统下 Rust 自带的 println! 不保证能写到控制台，这里统一走一个直接向
+// 标准输出句柄写入的通道（结合 AllocConsole / AttachConsole 使用）。
+
+fn open_console_stdout() -> Option<std::fs::File> {
+    unsafe {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h == 0 || h == -1 {
+            return None;
+        }
+        Some(std::fs::File::from_raw_handle(h as *mut std::ffi::c_void))
+    }
+}
+
+/// 往控制台写一行；未附着控制台时静默忽略。
+fn emit(msg: &str) {    use std::io::Write;
+    use std::sync::Mutex;
+    static CONSOLE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    let m = CONSOLE.get_or_init(|| Mutex::new(None));
+    let mut guard = m.lock().unwrap();
+    if guard.is_none() {
+        *guard = open_console_stdout();
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 /// 刷新 UI（托盘提示 + 主窗口）
 unsafe fn refresh_ui(hwnd: HWND) {
     update_tooltip(hwnd);
     if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+        apply_titlebar_theme(hwnd);
         gui::refresh_main_window(hwnd);
+        // 主题可能已切换：连同子控件一起重绘，让深浅色即时生效
+        invalidate_with_children(hwnd);
     }
+}
+
+/// 重绘窗口及其全部子控件（切换深浅色时让文字/输入框颜色跟着变）。
+unsafe fn invalidate_with_children(hwnd: HWND) {
+    unsafe extern "system" fn invalidate_child(h: HWND, _: isize) -> i32 {
+        InvalidateRect(h, std::ptr::null(), 1);
+        1
+    }
+    EnumChildWindows(hwnd, Some(invalidate_child), 0);
+    InvalidateRect(hwnd, std::ptr::null(), 1);
 }
 
 /// 左键托盘：显示/隐藏主窗口
@@ -442,6 +667,32 @@ unsafe fn save_schedule_time_from_edits(hwnd: HWND) {
             "时间已保存：浅色 {} 深色 {}",
             st.cfg.light_time, st.cfg.dark_time
         ));
+    }
+}
+
+/// 开机自启复选框被点击：按当前勾选状态写入/移除开机启动，并保存配置。
+unsafe fn on_autostart_clicked(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, SendMessageW};
+    const BM_GETCHECK: u32 = 0x00F0;
+    let chk = GetDlgItem(hwnd, gui::ID_CHK_AUTOSTART as i32);
+    if chk == 0 {
+        return;
+    }
+    let on = SendMessageW(chk, BM_GETCHECK, 0, 0) == 1;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(s) = APP_STATE.get() {
+        let mut st = s.lock().unwrap();
+        st.cfg.auto_start = on;
+        let _ = config::save(&st.cfg);
+        if on {
+            let _ = config::install_startup(&exe);
+            log("开机自启已开启（写注册表 Run 项）");
+        } else {
+            let _ = config::uninstall_startup();
+            log("开机自启已关闭（移除注册表 Run 项）");
+        }
     }
 }
 
@@ -605,7 +856,11 @@ unsafe fn nid_base(hwnd: HWND) -> NOTIFYICONDATAW {
 fn tray_hicon() -> isize {
     use std::sync::OnceLock;
     static ICON: OnceLock<isize> = OnceLock::new();
-    *ICON.get_or_init(|| unsafe { icon::load_icon(16) })
+    *ICON.get_or_init(|| {
+        let k = gui::dpi_scale_for_system();
+        let size = (16.0_f64 * k).round() as i32;
+        unsafe { icon::load_icon(size.max(16)) }
+    })
 }
 
 unsafe fn update_tooltip(hwnd: HWND) {
@@ -788,16 +1043,9 @@ fn widestring(s: &str) -> Vec<u16> {
     v
 }
 
-unsafe fn hide_console() {
-    let hw = GetConsoleWindow();
-    if hw != 0 {
-        ShowWindow(hw, SW_HIDE);
-    }
-}
-
 fn log(msg: &str) {
     if CONSOLE_MODE.load(Ordering::Relaxed) {
-        println!("[wintheme-auto] {msg}");
+        emit(&format!("[wintheme-auto] {msg}"));
     }
     let dir = config::config_dir();
     let _ = std::fs::create_dir_all(&dir);

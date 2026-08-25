@@ -2,6 +2,9 @@
 //
 // 策略：所有 Win32 常量按原始 u32 处理，最后再包成 WINDOW_STYLE / WINDOW_EX_STYLE。
 // windows-sys 0.52 的 NewType 没有实现 BitOr，所以位运算在 .0 上做。
+//
+// DPI：应用为 PerMonitorV2 DPI 感知，所有坐标按系统 DPI 缩放，否则在高分屏
+// （如 200%）下会被系统拉伸而模糊。
 
 #![allow(dead_code)]
 
@@ -12,17 +15,16 @@ use crate::theme::Theme;
 use crate::APP_STATE;
 use chrono::{Local, NaiveTime, Timelike};
 use std::ptr;
-use windows_sys::Win32::Foundation::HWND;
+use std::sync::OnceLock;
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, FONT_CHARSET, FONT_WEIGHT, FW_BOLD, GB2312_CHARSET, HFONT,
+    CreateFontW, FW_BOLD, GB2312_CHARSET, HFONT,
 };
-use windows_sys::Win32::Foundation::HINSTANCE;
-use windows_sys::Win32::System::SystemServices::{
-    SS_CENTER, SS_ICON, SS_LEFT,
-};
+use windows_sys::Win32::System::SystemServices::{SS_ICON, SS_LEFT};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetDlgItem, GetWindowTextW, SetWindowTextW, BS_PUSHBUTTON, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_NUMBER, WM_SETFONT,
+    CreateWindowExW, GetDlgItem, SetWindowTextW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_NUMBER,
+    WM_SETFONT,
 };
 use crate::theme;
 
@@ -45,8 +47,11 @@ pub const ID_EDIT_LIGHT: u32 = 4001;
 pub const ID_EDIT_DARK: u32 = 4002;
 pub const ID_BTN_SAVE_TIME: u32 = 4003;
 
-pub const WIN_W: i32 = 420;
-pub const WIN_H: i32 = 460;
+pub const ID_CHK_AUTOSTART: u32 = 5001;
+
+// 基础布局尺寸（按 96 DPI 设计，运行时按 DPI 缩放）
+pub const BASE_W: i32 = 460;
+pub const BASE_H: i32 = 420;
 
 // 常用 raw u32 window style（避免与 windows-sys 的 NewType 混用）
 mod raw {
@@ -71,14 +76,80 @@ fn w(s: &str) -> Vec<u16> {
     v
 }
 
+// ---- DPI 帮助 ----
+
+fn dpi_to_scale(dpi: u32) -> f64 {
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / 96.0
+    }
+}
+
+/// 当前系统 DPI 缩放系数（用于创建主窗口前的初始尺寸、托盘图标等）。
+pub fn dpi_scale_for_system() -> f64 {
+    // SAFETY: 无窗口前置条件
+    dpi_to_scale(unsafe { GetDpiForSystem() })
+}
+
+/// 某窗口当前所在显示器的 DPI 缩放系数。
+pub fn dpi_scale_for_window(hwnd: HWND) -> f64 {
+    // SAFETY: hwnd 须有效
+    dpi_to_scale(unsafe { GetDpiForWindow(hwnd) })
+}
+
+// ---- 控件字体：统一用微软雅黑，大小随 DPI 缩放，避免默认小字体 ----
+static UI_FONT: OnceLock<HFONT> = OnceLock::new();
+
+fn ui_font(k: f64) -> HFONT {
+    *UI_FONT.get_or_init(|| unsafe {
+        CreateFontW(
+            ((18.0 * k).round()) as i32, // 字高（像素，随 DPI 缩放）
+            0,
+            0,
+            0,
+            0, // FW_NORMAL：常规字重
+            0,
+            0,
+            0,
+            GB2312_CHARSET as u32,
+            0,
+            0,
+            0,
+            0,
+            w("Microsoft YaHei UI").as_ptr(),
+        )
+    })
+}
+
+/// 给子控件应用统一的 UI 字体。
+unsafe fn apply_ui_font(parent: HWND, control: HWND) {
+    if control == 0 {
+        return;
+    }
+    let k = dpi_scale_for_window(parent);
+    let f = ui_font(k);
+    if f != 0 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        use windows_sys::Win32::Foundation::WPARAM;
+        SendMessageW(control, WM_SETFONT, f as WPARAM, 1);
+    }
+}
+
 /// 在已创建的主窗口 `parent` 上填充子控件。
 ///
 /// # Safety
 /// 必须在主窗口已创建、且窗口类已注册后调用；hinst 须有效。
 pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
-    // 大字号粗体字体（"当前主题"标签用）
+    let k = dpi_scale_for_window(parent);
+    // 按 DPI 缩放坐标的辅助闭包
+    let s = |v: i32| -> i32 { ((v as f64) * k).round() as i32 };
+    let mx = s(26);
+    let content_w = s(BASE_W - 2 * 26);
+
+    // 大字号粗体字体（"当前主题"标签用），高度随 DPI 缩放
     let big_font: HFONT = CreateFontW(
-        32,
+        s(28),
         0,
         0,
         0,
@@ -94,45 +165,53 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         w("Microsoft YaHei UI").as_ptr(),
     );
 
-    // ---- 子控件布局（绝对坐标）----
-    let btn_h: i32 = 32;
-    let btn_w: i32 = 178;
-    let x: i32 = 20;
-    let mut y: i32 = 20;
+    // ---- 头部：大图标 + 当前主题大字 ----
+    make_static(parent, hinst, ID_LBL_ICON, SS_ICON, mx, s(20), s(52), s(52), "");
+    make_static(parent, hinst, ID_LBL_THEME, SS_LEFT, s(92), s(24), content_w - s(92 - 26), s(42), "");
 
-    // 大图标（左上）
-    make_static(parent, hinst, ID_LBL_ICON, SS_ICON, 20, 20, 56, 56, "");
-    // 主题大字（右侧，紧贴图标）
-    make_static(parent, hinst, ID_LBL_THEME, SS_LEFT, 88, 24, WIN_W - 88 - x, 48, "");
-    y = 96;
-    make_static(parent, hinst, ID_LBL_MODE, SS_LEFT, x, y, WIN_W - 2 * x, 22, "");
-    y += 24;
-    make_static(parent, hinst, ID_LBL_POS, SS_LEFT, x, y, WIN_W - 2 * x, 22, "");
-    y += 24;
-    make_static(parent, hinst, ID_LBL_NEXT, SS_LEFT, x, y, WIN_W - 2 * x, 22, "");
-    y += 32;
+    // ---- 状态信息行 ----
+    let mut y = s(92);
+    make_static(parent, hinst, ID_LBL_MODE, SS_LEFT, mx, y, content_w, s(20), "");
+    y += s(22);
+    make_static(parent, hinst, ID_LBL_POS, SS_LEFT, mx, y, content_w, s(20), "");
+    y += s(22);
+    make_static(parent, hinst, ID_LBL_NEXT, SS_LEFT, mx, y, content_w, s(20), "");
+    y += s(28);
 
-    // 时间编辑区
-    make_static(parent, hinst, 0, SS_LEFT, x, y, 110, 22, "浅色时刻 (HH:MM):");
-    make_edit(parent, hinst, ID_EDIT_LIGHT, x + 120, y - 2, 70, 24);
-    make_static(parent, hinst, 0, SS_LEFT, x + 200, y, 70, 22, "深色时刻:");
-    make_edit(parent, hinst, ID_EDIT_DARK, x + 275, y - 2, 70, 24);
-    make_button(parent, hinst, ID_BTN_SAVE_TIME, x + 350, y - 2, 50, 24, "保存");
-    y += 36;
+    // ---- 开机自启复选框 ----
+    let auto_start = APP_STATE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|st| st.cfg.auto_start)
+        .unwrap_or(true);
+    make_checkbox(parent, hinst, ID_CHK_AUTOSTART, mx, y, s(220), s(24), "开机自动启动", auto_start);
+    y += s(26);
 
-    // 底部提示
-    make_static(parent, hinst, ID_LBL_HINT, SS_LEFT, x, y, WIN_W - 2 * x, 20, "");
-    y += 28;
+    // ---- 定时模式：时间编辑区 ----
+    let row_h = s(24);
+    const SS_CENTERIMAGE: u32 = 0x0200; // 文字垂直居中，便于与输入框对齐
+    make_static(parent, hinst, 0, SS_LEFT | SS_CENTERIMAGE, mx, y, s(86), row_h, "浅色时刻:");
+    make_edit(parent, hinst, ID_EDIT_LIGHT, mx + s(88), y, s(64), row_h);
+    make_static(parent, hinst, 0, SS_LEFT | SS_CENTERIMAGE, mx + s(168), y, s(86), row_h, "深色时刻:");
+    make_edit(parent, hinst, ID_EDIT_DARK, mx + s(254), y, s(64), row_h);
+    make_button(parent, hinst, ID_BTN_SAVE_TIME, mx + s(344), y, s(68), row_h, "保存");
+    y += s(34);
 
-    // 按钮（两列）
-    let col2_x = x + btn_w + 14;
-    make_button(parent, hinst, ID_BTN_TOGGLE, x, y, btn_w, btn_h, "立即切换主题");
+    // ---- 底部提示 ----
+    make_static(parent, hinst, ID_LBL_HINT, SS_LEFT, mx, y, content_w, s(20), "");
+    y += s(28);
+
+    // ---- 按钮（两列）----
+    let btn_w = s(186);
+    let btn_h = s(36);
+    let col2_x = mx + s(186) + s(18);
+    make_button(parent, hinst, ID_BTN_TOGGLE, mx, y, btn_w, btn_h, "立即切换主题");
     make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "立即检查");
-    y += btn_h + 10;
-    make_button(parent, hinst, ID_BTN_CYCLE_MODE, x, y, btn_w, btn_h, "切换模式");
+    y += s(46);
+    make_button(parent, hinst, ID_BTN_CYCLE_MODE, mx, y, btn_w, btn_h, "切换模式");
     make_button(parent, hinst, ID_BTN_OPEN_CFG, col2_x, y, btn_w, btn_h, "打开配置文件");
-    y += btn_h + 10;
-    make_button(parent, hinst, ID_BTN_HIDE, x, y, btn_w, btn_h, "隐藏到托盘");
+    y += s(46);
+    make_button(parent, hinst, ID_BTN_HIDE, mx, y, btn_w, btn_h, "隐藏到托盘");
     make_button(parent, hinst, ID_BTN_EXIT, col2_x, y, btn_w, btn_h, "退出程序");
 
     // 给大字体标签设字体
@@ -162,7 +241,7 @@ unsafe fn make_static(
 ) -> HWND {
     let t = w(text);
     let s = raw::WS_CHILD | raw::WS_VISIBLE | style;
-    CreateWindowExW(
+    let h = CreateWindowExW(
         0,
         w("STATIC").as_ptr(),
         t.as_ptr(),
@@ -175,7 +254,9 @@ unsafe fn make_static(
         id as isize,
         hinst,
         ptr::null(),
-    )
+    );
+    apply_ui_font(parent, h);
+    h
 }
 
 unsafe fn make_button(
@@ -190,7 +271,7 @@ unsafe fn make_button(
 ) -> HWND {
     let t = w(text);
     let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_PUSHBUTTON as u32;
-    CreateWindowExW(
+    let h = CreateWindowExW(
         0,
         w("BUTTON").as_ptr(),
         t.as_ptr(),
@@ -203,7 +284,48 @@ unsafe fn make_button(
         id as isize,
         hinst,
         ptr::null(),
-    )
+    );
+    apply_ui_font(parent, h);
+    h
+}
+
+unsafe fn make_checkbox(
+    parent: HWND,
+    hinst: HINSTANCE,
+    id: u32,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    text: &str,
+    checked: bool,
+) -> HWND {
+    const BS_AUTOCHECKBOX: u32 = 0x0003;
+    const BM_SETCHECK: u32 = 0x00F1;
+    const BST_CHECKED: usize = 1;
+    let t = w(text);
+    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_AUTOCHECKBOX;
+    let h = CreateWindowExW(
+        0,
+        w("BUTTON").as_ptr(),
+        t.as_ptr(),
+        s,
+        x,
+        y,
+        cx,
+        cy,
+        parent,
+        id as isize,
+        hinst,
+        ptr::null(),
+    );
+    apply_ui_font(parent, h);
+    if h != 0 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let w: usize = if checked { BST_CHECKED } else { 0 };
+        SendMessageW(h, BM_SETCHECK, w, 0);
+    }
+    h
 }
 
 unsafe fn make_edit(
@@ -220,8 +342,8 @@ unsafe fn make_edit(
         | raw::WS_TABSTOP
         | ES_AUTOHSCROLL as u32
         | ES_NUMBER as u32;
-    CreateWindowExW(
-        raw::WS_EX_CLIENTEDGE,
+    let h = CreateWindowExW(
+        0, // 不用 WS_EX_CLIENTEDGE：避免深色模式下出现白色 3D 凹陷边框
         w("EDIT").as_ptr(),
         ptr::null(),
         s,
@@ -233,7 +355,9 @@ unsafe fn make_edit(
         id as isize,
         hinst,
         ptr::null(),
-    )
+    );
+    apply_ui_font(parent, h);
+    h
 }
 
 // ---- 刷新 UI 文本 ----
@@ -260,19 +384,14 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         Theme::Dark => "深色",
     };
     if let Some(h) = hwnd_opt(hwnd, ID_LBL_THEME) {
-        let prefix = match mode.as_str() {
-            "sun" => "跟随日出日落",
-            "schedule" => "定时切换",
-            "off" => "已暂停",
-            _ => "未知",
-        };
-        let s = w(&format!("当前：{} · {}", theme_text, prefix));
+        let s = w(&format!("当前：{}", theme_text));
         SetWindowTextW(h, s.as_ptr());
     }
 
-    // 大图标
+    // 大图标（尺寸随 DPI 缩放）
     if let Some(icon_h) = hwnd_opt(hwnd, ID_LBL_ICON) {
-        let hicon = icon::load_icon(48);
+        let k = dpi_scale_for_window(hwnd);
+        let hicon = icon::load_icon((48.0 * k).round() as i32);
         if hicon != 0 {
             use windows_sys::Win32::Foundation::WPARAM;
             use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
@@ -332,12 +451,19 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         SetWindowTextW(h, s.as_ptr());
     }
 
+    // 开机自启复选框：与配置同步
+    if let Some(h) = hwnd_opt(hwnd, ID_CHK_AUTOSTART) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        const BM_SETCHECK: u32 = 0x00F1;
+        let w: usize = if cfg.auto_start { 1 } else { 0 };
+        SendMessageW(h, BM_SETCHECK, w, 0);
+    }
+
     // 时间编辑框（仅 schedule 模式启用）
     let light_h = GetDlgItem(hwnd, ID_EDIT_LIGHT as i32);
     let dark_h = GetDlgItem(hwnd, ID_EDIT_DARK as i32);
     let save_h = GetDlgItem(hwnd, ID_BTN_SAVE_TIME as i32);
-    let enable = mode == "schedule";
-    if light_h != 0 {
+    let enable = mode == "schedule";    if light_h != 0 {
         send_message_enable(light_h, enable);
         let s = w(&cfg.light_time);
         SetWindowTextW(light_h, s.as_ptr());

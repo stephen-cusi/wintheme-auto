@@ -19,12 +19,19 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security",
     # STATIC 控件 style (SS_LEFT/SS_ICON/SS_CENTER) 在 SystemServices
     "Win32_System_SystemServices",
+    # 高 DPI 感知：SetProcessDpiAwarenessContext / GetDpiForSystem / GetDpiForWindow
+    "Win32_UI_HiDpi",
+    # 深色标题栏：DwmSetWindowAttribute
+    "Win32_Graphics_Dwm",
 ] }
 winreg = "0.52"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
+
+[build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = "z"
