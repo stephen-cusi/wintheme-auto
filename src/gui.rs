@@ -13,6 +13,7 @@ use crate::icon;
 use crate::sun;
 use crate::theme::Theme;
 use crate::APP_STATE;
+use crate::CoordsSource;
 use chrono::{Local, NaiveTime, Timelike};
 use std::ptr;
 use std::sync::OnceLock;
@@ -50,11 +51,14 @@ pub const ID_BTN_SAVE_TIME: u32 = 4003;
 pub const ID_CHK_AUTOSTART: u32 = 5001;
 pub const ID_CHK_START_MINIMIZED: u32 = 5002;
 pub const ID_BTN_ABOUT: u32 = 5003;
+/// 主窗口上"打开系统位置设置"按钮——直跳 Windows 设置的位置页
+pub const ID_BTN_OPEN_LOCATION_SETTINGS: u32 = 5004;
 
 // 基础布局尺寸（按 96 DPI 设计，运行时按 DPI 缩放）
 pub const BASE_W: i32 = 480;
-// 高度需容纳：头部 + 3 行状态 + 自启 + 静默 + 时间 + 提示 + 3 行按钮 + 关于按钮 + 边距
-pub const BASE_H: i32 = 520;
+// 高度需容纳：头部 + 3 行状态 + 自启 + 静默 + 「打开位置设置」按钮（条件显示） +
+// 时间 + 提示 + 3 行按钮 + 边距。给「打开位置设置」按钮留出 ~30px 备用空间。
+pub const BASE_H: i32 = 550;
 
 // 常用 raw u32 window style（避免与 windows-sys 的 NewType 混用）
 mod raw {
@@ -106,7 +110,7 @@ pub fn dpi_scale_for_window(hwnd: HWND) -> f64 {
 // ---- 控件字体：统一用微软雅黑，大小随 DPI 缩放，避免默认小字体 ----
 static UI_FONT: OnceLock<HFONT> = OnceLock::new();
 
-fn ui_font(k: f64) -> HFONT {
+pub fn ui_font(k: f64) -> HFONT {
     *UI_FONT.get_or_init(|| unsafe {
         CreateFontW(
             ((18.0 * k).round()) as i32, // 字高（像素，随 DPI 缩放）
@@ -244,6 +248,23 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     }
     y += s(30);
 
+    // ---- 「打开系统位置设置」按钮：仅当 LocationStatus=Disabled 时显示 ----
+    // 让用户一眼能跳到设置页，不用自己去找「设置 → 隐私和安全性 → 位置」
+    let open_settings_h = make_button(
+        parent,
+        hinst,
+        ID_BTN_OPEN_LOCATION_SETTINGS,
+        mx,
+        y,
+        content_w,
+        s(28),
+        "打开系统位置设置",
+    );
+    // 默认隐藏；refresh_main_window 在 location_status="Disabled" 时显示
+    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
+    ShowWindow(open_settings_h, 0);
+    y += s(30);
+
     // ---- 定时模式：时间编辑区（紧凑单行，三个元素横排）----
     let row_h = s(26);
     const SS_CENTERIMAGE: u32 = 0x0200;
@@ -295,7 +316,7 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     let btn_w = col_w;
     let col2_x = mx + btn_w + gap_x;
     make_button(parent, hinst, ID_BTN_TOGGLE, mx, y, btn_w, btn_h, "立即切换主题");
-    make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "重新获取位置");
+    make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "刷新");
     y += btn_h + s(10);
     make_button(parent, hinst, ID_BTN_CYCLE_MODE, mx, y, btn_w, btn_h, "切换模式");
     make_button(parent, hinst, ID_BTN_OPEN_CFG, col2_x, y, btn_w, btn_h, "打开配置文件");
@@ -512,18 +533,62 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         SetWindowTextW(h, s.as_ptr());
     }
 
-    // 位置
+    // 位置（显示坐标 + 来源标签：[系统] / [手动配置] / [缓存] / 或具体失败原因）
     if let Some(h) = hwnd_opt(hwnd, ID_LBL_POS) {
-        let line = match st.coords {
-            Some((lat, lon)) => format!("位置：{:.4}, {:.4}    IP 定位", lat, lon),
-            None if st.fetching_coords => "位置：正在后台获取...".to_string(),
-            None => match (cfg.latitude, cfg.longitude) {
-                (Some(_), Some(_)) => "位置：已配置（手动）".to_string(),
-                _ => "位置：未确定".to_string(),
-            },
+        let line = match (st.coords, st.coords_source, st.fetching_coords) {
+            (Some((lat, lon)), CoordsSource::System, _) => {
+                format!("位置：{:.4}, {:.4}    [系统]", lat, lon)
+            }
+            (Some((lat, lon)), CoordsSource::Config, _) => {
+                format!("位置：{:.4}, {:.4}    [手动配置]", lat, lon)
+            }
+            (Some((lat, lon)), CoordsSource::CachedFile, _) => {
+                format!("位置：{:.4}, {:.4}    [缓存]", lat, lon)
+            }
+            (Some((lat, lon)), CoordsSource::None, _) => {
+                format!("位置：{:.4}, {:.4}", lat, lon)
+            }
+            (None, _, true) => "位置：正在后台获取...".to_string(),
+            (None, _, false) if st.tz_offset_hours.is_none() => {
+                "位置：等待系统时区与位置...".to_string()
+            }
+            (None, _, false) => {
+                // 按系统位置 API 的 LocationStatus 给出针对性提示
+                // - "Disabled" / "NotAvailable" / "NoData" / "NotInitialized" / "Initializing"
+                //   来自 Geolocator.LocationStatus（系统级）
+                // - "Denied" / "Unspecified" 来自 RequestAccessAsync（用户授权级）
+                let status = st.location_status.as_deref();
+                let hint = match status {
+                    Some("Disabled") => "系统位置主开关已关闭",
+                    Some("Denied") => "已拒绝本 app 的位置权限",
+                    Some("Unspecified") => "未指定本 app 的位置权限",
+                    Some("NotAvailable") => "设备没有可用的位置源（GPS / Wi-Fi 三角）",
+                    Some("NoData") => "位置传感器暂时无法获取数据（GPS 信号弱）",
+                    Some("NotInitialized") => "位置服务还在初始化中，请稍后重试",
+                    Some("Initializing") => "位置服务正在初始化中，请稍后重试",
+                    Some(other) => other,
+                    None => "请检查系统位置权限",
+                };
+                // 引导用户去设置的两种情况
+                let goto_settings = matches!(status, Some("Disabled") | Some("Denied"));
+                if goto_settings {
+                    format!("位置：不可用 — {hint}（点下方按钮打开设置）")
+                } else {
+                    format!("位置：不可用 — {hint}")
+                }
+            }
         };
         let s = w(&line);
         SetWindowTextW(h, s.as_ptr());
+    }
+
+    // 「打开系统位置设置」按钮：Disabled（系统主开关）或 Denied（app 权限被拒）都显示
+    if let Some(h) = hwnd_opt(hwnd, ID_BTN_OPEN_LOCATION_SETTINGS) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
+        let status = st.location_status.as_deref();
+        let visible = matches!(status, Some("Disabled") | Some("Denied"));
+        let cmd = if visible { 5 } else { 0 }; // 5=SW_SHOW, 0=SW_HIDE
+        ShowWindow(h, cmd);
     }
 
     // 下一动作

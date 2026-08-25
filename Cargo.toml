@@ -25,6 +25,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_Graphics_Dwm",
     # 自绘按钮：DRAWITEMSTRUCT / ODS_*
     "Win32_UI_Controls",
+    # 系统时区：GetTimeZoneInformation / TIME_ZONE_INFORMATION
+    "Win32_System_Time",
 ] }
 winreg = "0.52"
 chrono = "0.4"
