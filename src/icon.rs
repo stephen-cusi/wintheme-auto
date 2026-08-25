@@ -94,6 +94,6 @@ pub unsafe fn load_icon(cx: i32) -> HICON {
         0x00030000,   // dwVer
         cx,
         cx,
-        IMAGE_FLAGS(0),
+        0,
     )
 }

@@ -16,10 +16,16 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, FONT_CHARSET, FONT_WEIGHT, FW_BOLD, GB2312_CHARSET, HFONT,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetDlgItem, SetWindowTextW, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL,
-    ES_NUMBER, HINSTANCE, SS_CENTER, SS_ICON, SS_LEFT, WM_SETFONT, WINDOW_EX_STYLE, WINDOW_STYLE,
+use windows_sys::Win32::Foundation::HINSTANCE;
+use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject};
+use windows_sys::Win32::System::SystemServices::{
+    SS_CENTER, SS_ICON, SS_LEFT,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, GetDlgItem, GetWindowTextW, SetWindowTextW, BS_PUSHBUTTON, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_NUMBER, WM_SETFONT,
+};
+use crate::theme;
 
 // ---- 控件 ID ----
 pub const ID_BTN_TOGGLE: u32 = 2001;
@@ -77,11 +83,11 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         0,
         0,
         0,
-        FONT_WEIGHT(FW_BOLD.0).0,
+        FW_BOLD,
         0,
         0,
         0,
-        FONT_CHARSET(GB2312_CHARSET.0).0,
+        GB2312_CHARSET,
         0,
         0,
         0,
@@ -132,7 +138,7 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
 
     // 给大字体标签设字体
     let theme_lbl = GetDlgItem(parent, ID_LBL_THEME as i32);
-    if !theme_lbl.is_null() && big_font != 0 {
+    if theme_lbl != 0 && big_font != 0 {
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
         use windows_sys::Win32::Foundation::WPARAM;
         SendMessageW(theme_lbl, WM_SETFONT, big_font as WPARAM, 1);
@@ -157,9 +163,9 @@ unsafe fn make_static(
     text: &str,
 ) -> HWND {
     let t = w(text);
-    let s = WINDOW_STYLE(raw::WS_CHILD | raw::WS_VISIBLE | style);
+    let s = raw::WS_CHILD | raw::WS_VISIBLE | style;
     CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        0,
         w("STATIC").as_ptr(),
         t.as_ptr(),
         s,
@@ -185,11 +191,11 @@ unsafe fn make_button(
     text: &str,
 ) -> HWND {
     let t = w(text);
-    let s = WINDOW_STYLE(
+    let s = 
         raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_PUSHBUTTON as u32,
-    );
+    ;
     CreateWindowExW(
-        WINDOW_EX_STYLE(0),
+        0,
         w("BUTTON").as_ptr(),
         t.as_ptr(),
         s,
@@ -213,13 +219,13 @@ unsafe fn make_edit(
     cx: i32,
     cy: i32,
 ) -> HWND {
-    let s = WINDOW_STYLE(
+    let s = 
         raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP
             | ES_AUTOHSCROLL as u32
             | ES_NUMBER as u32,
-    );
+    ;
     CreateWindowExW(
-        WINDOW_EX_STYLE(raw::WS_EX_CLIENTEDGE),
+        raw::WS_EX_CLIENTEDGE,
         w("EDIT").as_ptr(),
         ptr::null(),
         s,
@@ -335,17 +341,17 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
     let dark_h = GetDlgItem(hwnd, ID_EDIT_DARK as i32);
     let save_h = GetDlgItem(hwnd, ID_BTN_SAVE_TIME as i32);
     let enable = mode == "schedule";
-    if !light_h.is_null() {
+    if light_h != 0 {
         send_message_enable(light_h, enable);
         let s = w(&cfg.light_time);
         SetWindowTextW(light_h, s.as_ptr());
     }
-    if !dark_h.is_null() {
+    if dark_h != 0 {
         send_message_enable(dark_h, enable);
         let s = w(&cfg.dark_time);
         SetWindowTextW(dark_h, s.as_ptr());
     }
-    if !save_h.is_null() {
+    if save_h != 0 {
         send_message_enable(save_h, enable);
     }
 
@@ -368,7 +374,7 @@ unsafe fn send_message_enable(h: HWND, enable: bool) {
 
 fn hwnd_opt(parent: HWND, id: u32) -> Option<HWND> {
     let h = unsafe { GetDlgItem(parent, id as i32) };
-    if h.is_null() {
+    if h == 0 {
         None
     } else {
         Some(h)

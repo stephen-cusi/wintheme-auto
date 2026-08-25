@@ -215,8 +215,8 @@ fn run_event_loop() -> anyhow::Result<()> {
             )
         } else {
             (
-                WINDOW_STYLE(0),
-                WINDOW_EX_STYLE(0),
+                0,
+                0,
                 HWND_MESSAGE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -419,7 +419,7 @@ unsafe fn save_schedule_time_from_edits(hwnd: HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem;
     let light_h = GetDlgItem(hwnd, gui::ID_EDIT_LIGHT as i32);
     let dark_h = GetDlgItem(hwnd, gui::ID_EDIT_DARK as i32);
-    if light_h.is_null() || dark_h.is_null() {
+    if light_h == 0 || dark_h == 0 {
         return;
     }
     let mut buf1 = [0u16; 16];
