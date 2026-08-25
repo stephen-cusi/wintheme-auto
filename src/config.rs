@@ -85,7 +85,9 @@ pub fn install_startup(exe_path: &str) -> io::Result<()> {
         r"Software\Microsoft\Windows\CurrentVersion\Run",
         KEY_WRITE,
     )?;
-    run.set_value("WinThemeAuto", exe_path)?;
+    // winreg 0.52 的 set_value 签名是 value: &T，&str 通过 ToRegValue 宏实现，
+    // 因此字符串要传 &&str（如示例 &"www.example.com"）。
+    run.set_value("WinThemeAuto", &exe_path)?;
     Ok(())
 }
 

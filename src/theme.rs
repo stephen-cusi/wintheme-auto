@@ -36,7 +36,7 @@ pub fn set_theme(theme: Theme) -> io::Result<()> {
             param.as_ptr() as LPARAM,
             SMTO_ABORTIFHUNG,
             100,
-            std::ptr::null_mut::<u32>(),
+            std::ptr::null_mut::<usize>(), // lpdwresult 是 *mut usize
         );
     }
     Ok(())

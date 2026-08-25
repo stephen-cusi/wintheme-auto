@@ -10,7 +10,8 @@ use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, UINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, WPARAM};
+use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -18,11 +19,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu,
-    DestroyWindow, GetConsoleWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW,
-    IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL,
-    TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CREATE,
-    WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
+    DestroyWindow, GetCursorPos, GetMessageW, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
+    LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TranslateMessage, DispatchMessageW, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW, HWND_MESSAGE,
 };
 
 use crate::config::Config;
@@ -40,7 +41,8 @@ const ID_CONFIG: u32 = 1008;
 const ID_EXIT: u32 = 1009;
 
 const TRAY_ICON_ID: u32 = 1;
-const WM_TRAY: UINT = WM_APP + 1;
+// windows-sys 0.52 没有 UINT 类型，消息类型直接用 u32（WNDPROC 签名即 u32）
+const WM_TRAY: u32 = WM_APP + 1;
 
 static APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 
@@ -138,14 +140,16 @@ fn run_headless() -> anyhow::Result<()> {
 
 fn run_tray() -> anyhow::Result<()> {
     unsafe {
-        let hinst = GetModuleHandleW(ptr::null_mut());
+        // 注意：windows-sys 0.52 的句柄（HWND/HINSTANCE/HMENU 等）是 isize 整数，不是指针。
+        // 传"空句柄"用 0，传空指针参数用 ptr::null()。
+        let hinst = GetModuleHandleW(ptr::null());
         let class_name = widestring("WinthemeAutoClass");
         let title = widestring("WinthemeAuto");
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wnd_proc);
         wc.hInstance = hinst;
         wc.lpszClassName = class_name.as_ptr();
-        wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
+        wc.hCursor = LoadCursorW(0, IDC_ARROW);
         if RegisterClassW(&wc) == 0 {
             log("RegisterClassW 失败");
         }
@@ -159,16 +163,16 @@ fn run_tray() -> anyhow::Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             HWND_MESSAGE,
-            ptr::null_mut(),
+            0, // hMenu（isize）
             hinst,
-            ptr::null_mut(),
+            ptr::null(), // lpParam: *const c_void
         );
-        if hwnd.is_null() {
+        if hwnd == 0 {
             log("创建窗口失败，回退到无托盘模式");
             return run_headless();
         }
         let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -180,7 +184,7 @@ fn run_tray() -> anyhow::Result<()> {
 
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
-    msg: UINT,
+    msg: u32,
     _wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
@@ -362,7 +366,7 @@ unsafe fn open_config() {
     let path_w: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
     ShellExecuteW(
-        ptr::null_mut(),
+        0, // hwnd 是 isize 句柄，空句柄传 0
         verb.as_ptr(),
         path_w.as_ptr(),
         ptr::null(),
@@ -382,7 +386,7 @@ unsafe fn nid_base(hwnd: HWND) -> NOTIFYICONDATAW {
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+    nid.hIcon = LoadIconW(0, IDI_APPLICATION);
     nid
 }
 
@@ -544,7 +548,7 @@ fn widestring(s: &str) -> Vec<u16> {
 
 unsafe fn hide_console() {
     let hw = GetConsoleWindow();
-    if !hw.is_null() {
+    if hw != 0 {
         ShowWindow(hw, SW_HIDE);
     }
 }
