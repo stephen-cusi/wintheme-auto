@@ -106,6 +106,12 @@ try {
 
     // PowerShell + GetGeopositionAsync 整套流程最多等 30 秒（系统权限对话框会让它卡住）。
     // 此处对子进程做一次总超时，避免无限制等待。
+    //
+    // CREATE_NO_WINDOW (0x08000000)：powershell.exe 本身是 console 子系统，
+    // 不加这个标志会在我们（GUI subsystem）里临时弹一个 cmd 窗口闪烁一下。
+    // 通过 std::os::windows::process::CommandExt::creation_flags 设置。
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -114,6 +120,7 @@ try {
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| anyhow!("无法启动 PowerShell: {e}（请确认 PowerShell 5+ 在 PATH 中）"))?;
 

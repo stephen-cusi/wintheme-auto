@@ -18,12 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::core::PCSTR;
-use windows_sys::Win32::System::Console::{
-    AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
-};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetModuleHandleW, GetProcAddress, LoadLibraryW,
-};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -68,8 +63,6 @@ const WM_TRAY: u32 = WM_APP + 1;
 const MSG_REFRESH: u32 = WM_APP + 2;
 
 static APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
-/// --console 模式：不隐藏控制台，log() 同时输出到 stdout
-static CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
 
 struct AppState {
     cfg: Config,
@@ -88,51 +81,13 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         enable_dark_mode();
+        flush_menu_themes();
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-
-    // GUI 子系统下默认不弹出控制台；--console 自建控制台，其他命令尝试挂到父控制台。
-    let console_args = args.iter().any(|a| a == "--console");
-    if console_args {
-        unsafe { AllocConsole() };
-        CONSOLE_MODE.store(true, Ordering::Relaxed);
-    } else {
-        // 使 CLI 命令在终端里的 println! 输出可见（双击无父控制台则失败并忽略）
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
-    }
-
-    // 一次性命令（带 -- 前缀的都视为命令行调用）
-    if args.iter().any(|a| a == "--light") {
-        theme::set_theme(Theme::Light)?;
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--dark") {
-        theme::set_theme(Theme::Dark)?;
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--uninstall") {
-        config::uninstall_startup()?;
-        emit("已移除开机启动注册表项。");
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--status") {
-        let t = theme::get_theme()
-            .map(|t| if t == Theme::Light { "浅色(light)" } else { "深色(dark)" })
-            .unwrap_or("未知");
-        emit(&format!("当前主题: {}", t));
-        return Ok(());
-    }
-
-    if args.iter().any(|a| a == "--install") {
-        // --install 显式以"静默"模式写注册表（用户主动装自启时不会想每次登录都被弹窗）
-        config::install_startup(&exe, true)?;
-        emit("已写入开机启动注册表项，登录后将在托盘中静默运行（不再弹主窗口）。");
-    }
 
     // 单实例：互斥体已存在（错误码 183 = ERROR_ALREADY_EXISTS）即说明已有实例在运行。
-    // 注意：CreateMutexW 在已存在时会返回一个有效句柄并置 last_error=183，不能用“返回 0”判断。
+    // 注意：CreateMutexW 在已存在时会返回一个有效句柄并置 last_error=183，不能用"返回 0"判断。
     unsafe {
         let mutex_name = widestring("Local\\WinThemeAuto-SingleInstance");
         let held = CreateMutexW(ptr::null(), 1, mutex_name.as_ptr());
@@ -151,11 +106,15 @@ fn main() -> anyhow::Result<()> {
         std::mem::forget(held);
     }
 
+    // 仅在自启动场景下由注册表 Run 项带入 --silent，意图是"不要弹主窗口、只在托盘里跑"。
+    // 用户双击 exe 时不会带这个 flag，所以默认总是显示主窗口。
+    let silent = args.iter().any(|a| a == "--silent");
+
     let cfg = config::load()?;
-    if cfg.auto_start && !args.iter().any(|a| a == "--no-autostart") {
+    if cfg.auto_start {
         // 写注册表时带上 --silent 标志，登录后程序在托盘里静默常驻，不弹主窗口。
         // （用户想"开机就看到主窗口"的话，可以在主窗口的"开机自启"下方关掉 start_minimized。）
-        let _ = config::install_startup(&exe, cfg.start_minimized);
+        let _ = config::install_startup(&cfg_exe()?, cfg.start_minimized);
     }
 
     let state = AppState {
@@ -170,15 +129,19 @@ fn main() -> anyhow::Result<()> {
         .set(Arc::new(Mutex::new(state)))
         .map_err(|_| anyhow!("APP_STATE 已初始化"))?;
 
-    if args.iter().any(|a| a == "--tray-only" || a == "--silent") {
-        // --silent: 开机自启时由注册表 Run 项带入此参数，意图是"不要弹主窗口"。
-        // --tray-only: 保留的旧行为，行为一致。
+    if silent {
+        // 静默启动：托盘常驻，不弹主窗口。
         run_tray_only()?;
     } else {
         // 默认：标准 GUI 主窗口 + 系统托盘
         run_gui()?;
     }
     Ok(())
+}
+
+/// 获取当前 exe 路径（用于写注册表 Run 项）。
+fn cfg_exe() -> anyhow::Result<String> {
+    Ok(std::env::current_exe()?.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +375,10 @@ unsafe extern "system" fn wnd_proc(
                     // 通常用于：①位置信息被锁/换城市后；②想看新一次 fetch 的来源日志。
                     force_reload_location_and_tick(hwnd);
                     refresh_ui(hwnd);
+                }
+                gui::ID_BTN_ABOUT => {
+                    // 关于对话框：作者 / 版本 / 简短说明。
+                    show_about_dialog(hwnd);
                 }
                 gui::ID_BTN_OPEN_CFG => handle_menu_cmd(hwnd, ID_CONFIG),
                 gui::ID_BTN_HIDE => {
@@ -695,33 +662,22 @@ unsafe fn allow_dark_window(hwnd: HWND) {
     }
 }
 
-// ---- 控制台输出 ----
-// GUI 子系统下 Rust 自带的 println! 不保证能写到控制台，这里统一走一个直接向
-// 标准输出句柄写入的通道（结合 AllocConsole / AttachConsole 使用）。
-
-fn open_console_stdout() -> Option<std::fs::File> {
-    unsafe {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
-        let h = GetStdHandle(STD_OUTPUT_HANDLE);
-        if h == 0 || h == -1 {
-            return None;
-        }
-        Some(std::fs::File::from_raw_handle(h as *mut std::ffi::c_void))
+/// 强制让系统丢弃本进程已缓存的菜单主题，强制下次 menu 弹出时重新读取深色偏好。
+///
+/// uxtheme 的非公开 API。对我们 app 自己创建的菜单（如果有）有效，能让 popup menu
+/// 立即切到深色样式。但**系统托盘（Explorer 进程）的右键菜单**不在本进程，所以
+/// 严格来说这个调用对系统托盘菜单无效——它是 Explorer 自己的 theme setting。
+/// 保留调用是因为：未来如果加 app 级 popup menu，能自动跟随主题。
+unsafe fn flush_menu_themes() {
+    type FlushMenuThemes = unsafe extern "system" fn() -> i32;
+    let dll = LoadLibraryW(widestring("uxtheme.dll").as_ptr());
+    if dll == 0 {
+        return;
     }
-}
-
-/// 往控制台写一行；未附着控制台时静默忽略。
-fn emit(msg: &str) {    use std::io::Write;
-    use std::sync::Mutex;
-    static CONSOLE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
-    let m = CONSOLE.get_or_init(|| Mutex::new(None));
-    let mut guard = m.lock().unwrap();
-    if guard.is_none() {
-        *guard = open_console_stdout();
-    }
-    if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{msg}");
+    let proc = GetProcAddress(dll, b"FlushMenuThemes\0".as_ptr() as PCSTR);
+    if let Some(base) = proc {
+        let f: FlushMenuThemes = std::mem::transmute(base);
+        let _ = f();
     }
 }
 
@@ -819,6 +775,29 @@ unsafe fn on_autostart_clicked(hwnd: HWND) {
             log("开机自启已关闭（移除注册表 Run 项）");
         }
     }
+}
+
+/// 弹"关于"对话框：显示作者、版本和简要说明。复用 MessageBoxW 即可，
+/// 不必为这一屏的静态信息单独建一个窗口类。
+unsafe fn show_about_dialog(parent: HWND) {
+    let version = env!("CARGO_PKG_VERSION");
+    let text = format!(
+        "WinTheme Auto v{version}\n\n\
+         Windows 11 浅色/深色主题自动切换器。\n\
+         支持跟随当地日出日落（基于系统位置 API，自动回退 IP 定位）\n\
+         或定时切换，开机可静默在托盘后台运行。\n\n\
+         作者：stephen-cusi\n\
+         仓库：https://github.com/stephen-cusi/wintheme-auto\n\
+         协议：MIT License\n\n\
+         原生 Win32 + Rust 编写，零额外运行时依赖。"
+    );
+    let text_w = widestring(&text);
+    let cap = widestring("关于 WinTheme Auto");
+    // MB_OK | MB_ICONINFORMATION | MB_TOPMOST 让用户一眼看到
+    const MB_OK: u32 = 0x0;
+    const MB_ICONINFORMATION: u32 = 0x40;
+    const MB_TOPMOST: u32 = 0x40000;
+    MessageBoxW(parent, text_w.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
 }
 
 /// 开机静默启动复选框被点击：翻转 cfg.start_minimized 持久化。
@@ -1234,9 +1213,6 @@ fn widestring(s: &str) -> Vec<u16> {
 }
 
 fn log(msg: &str) {
-    if CONSOLE_MODE.load(Ordering::Relaxed) {
-        emit(&format!("[wintheme-auto] {msg}"));
-    }
     let dir = config::config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("wintheme-auto.log");

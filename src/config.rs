@@ -48,13 +48,18 @@ impl Default for Config {
     }
 }
 
-/// 配置所在目录：%APPDATA%\wintheme-auto
+/// 配置所在目录：`<exe 所在目录>\wintheme-auto\`
+///
+/// 放在 exe 旁边而不是 `%APPDATA%`，是为了让程序"绿色化"——把整个目录拷到
+/// 任何地方都能直接跑（USB 盘、D:\portable\、测试 vm 等），日志/配置跟着走，
+/// 不污染系统目录，也不会在多用户系统里和其他用户互相覆盖。
 pub fn config_dir() -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join("wintheme-auto")
-    } else {
-        PathBuf::from(".").join("wintheme-auto")
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("wintheme-auto");
+        }
     }
+    PathBuf::from(".").join("wintheme-auto")
 }
 
 pub fn config_path() -> PathBuf {

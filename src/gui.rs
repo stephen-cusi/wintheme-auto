@@ -23,7 +23,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::SystemServices::{SS_ICON, SS_LEFT};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetDlgItem, SetWindowTextW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_NUMBER,
+    CreateWindowExW, GetDlgItem, SetWindowTextW, ES_AUTOHSCROLL, ES_NUMBER,
     WM_SETFONT,
 };
 use crate::theme;
@@ -49,10 +49,12 @@ pub const ID_BTN_SAVE_TIME: u32 = 4003;
 
 pub const ID_CHK_AUTOSTART: u32 = 5001;
 pub const ID_CHK_START_MINIMIZED: u32 = 5002;
+pub const ID_BTN_ABOUT: u32 = 5003;
 
 // 基础布局尺寸（按 96 DPI 设计，运行时按 DPI 缩放）
 pub const BASE_W: i32 = 480;
-pub const BASE_H: i32 = 460;
+// 高度需容纳：头部 + 3 行状态 + 自启 + 静默 + 时间 + 提示 + 3 行按钮 + 关于按钮 + 边距
+pub const BASE_H: i32 = 520;
 
 // 常用 raw u32 window style（避免与 windows-sys 的 NewType 混用）
 mod raw {
@@ -172,7 +174,7 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         w("Microsoft YaHei UI").as_ptr(),
     );
 
-    // ---- 顶部留白 + 头部：大图标 + 当前主题大字 ----
+    // ---- 顶部留白 + 头部：大图标 + 当前主题大字 + 右上角"关于"按钮 ----
     make_static(parent, hinst, ID_LBL_ICON, SS_ICON, mx, s(20), s(52), s(52), "");
     make_static(
         parent,
@@ -181,9 +183,20 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         SS_LEFT,
         mx + s(70),
         s(22),
-        content_w - s(70),
+        content_w - s(70) - s(56), // 给右上角"关于"按钮留 48+8=56
         s(48),
         "",
+    );
+    // 右上角"关于"按钮（与 icon 垂直对齐）
+    make_button(
+        parent,
+        hinst,
+        ID_BTN_ABOUT,
+        mx + content_w - s(48),
+        s(28),
+        s(48),
+        s(36),
+        "关于",
     );
 
     // ---- 状态信息行（紧凑三行）----
@@ -205,22 +218,30 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     y += s(28);
 
     // ---- 开机自启的"静默"复选框：登录时进托盘，不弹主窗口 ----
+    // 仅当 auto_start=true 时才显示——避免一开屏就出现"这个选项是干嘛的？"的孤儿。
+    // 运行时由 main.rs 的 refresh_main_window 根据 cfg.auto_start 切换显隐。
     let start_minimized = APP_STATE
         .get()
         .and_then(|s| s.lock().ok())
         .map(|st| st.cfg.start_minimized)
         .unwrap_or(true);
-    make_checkbox(
+    let start_minimized_h = make_checkbox(
         parent,
         hinst,
         ID_CHK_START_MINIMIZED,
         mx + s(20),
         y,
-        s(260),
+        s(290),
         s(24),
         "  └ 开机时只在托盘后台运行（不弹主窗口）",
         start_minimized,
     );
+    if !auto_start {
+        // 初始就不带 WS_VISIBLE，refresh_main_window 会按 cfg.auto_start 同步。
+        // ShowWindow 第二个参数 0 = SW_HIDE，避开 import 路径差异。
+        use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
+        ShowWindow(start_minimized_h, 0);
+    }
     y += s(30);
 
     // ---- 定时模式：时间编辑区（紧凑单行，三个元素横排）----
@@ -528,12 +549,15 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         let w: usize = if cfg.auto_start { 1 } else { 0 };
         SendMessageW(h, BM_SETCHECK, w, 0);
     }
-    // 开机静默启动复选框：与配置同步
+    // 开机静默启动复选框：与配置同步，且**只在 auto_start=true 时显示**（避免孤儿选项）
     if let Some(h) = hwnd_opt(hwnd, ID_CHK_START_MINIMIZED) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, ShowWindow};
         const BM_SETCHECK: u32 = 0x00F1;
         let w: usize = if cfg.start_minimized { 1 } else { 0 };
         SendMessageW(h, BM_SETCHECK, w, 0);
+        // ShowWindow: 0 = SW_HIDE, 5 = SW_SHOW
+        let cmd = if cfg.auto_start { 5 } else { 0 };
+        ShowWindow(h, cmd);
     }
 
     // 时间编辑框（仅 schedule 模式启用）
