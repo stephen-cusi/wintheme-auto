@@ -77,6 +77,16 @@ try {
     $loc = New-Object Windows.Devices.Geolocation.Geolocator
     $loc.DesiredAccuracy = [Windows.Devices.Geolocation.PositionAccuracy]::Default
 
+    # 关键优化：先查 Geolocator.LocationStatus（轻量、不会弹权限框）。如果系统设置
+    # 里的「位置」主开关是关的、或者设备根本没有位置传感器，立即返回 DISABLED，
+    # 而不是去等 GetGeopositionAsync 一直挂起到我们 30 秒超时。
+    $status = $loc.LocationStatus.ToString()
+    Write-Output ("STAGE:status_" + $status)
+    if ($status -ne "Ready") {
+        Write-Output "RESULT:DISABLED"
+        exit 0
+    }
+
     Write-Output "STAGE:calling_async"
     $op = $loc.GetGeopositionAsync()
     $task = $asTaskGeneric.MakeGenericMethod([Windows.Devices.Geolocation.Geoposition]).Invoke($null, @($op))
@@ -151,14 +161,25 @@ try {
         return Err(anyhow!("系统位置 API 调用失败: {detail}"));
     }
 
-    let line = out
+    let result_line = out
         .lines()
         .map(|l| l.trim())
         .find(|l| l.starts_with("RESULT:"))
-        .map(|l| l.trim_start_matches("RESULT:").to_string())
-        .ok_or_else(|| anyhow!("系统位置 API 返回为空：完整输出 = {}", out.trim()))?;
-    let (lat, lon) = parse_lat_lon(&line)?;
-    Ok((lat, lon))
+        .map(|l| l.trim_start_matches("RESULT:").to_string());
+
+    match result_line.as_deref() {
+        Some("DISABLED") => {
+            return Err(anyhow!(
+                "系统位置不可用（LocationStatus=非 Ready）— 通常是「设置 → 隐私 → 位置」主开关已关，\
+                 或设备无位置传感器"
+            ));
+        }
+        Some(coords) if coords.contains(',') => {
+            let (lat, lon) = parse_lat_lon(coords)?;
+            Ok((lat, lon))
+        }
+        _ => Err(anyhow!("系统位置 API 返回异常: {:?}", out.trim())),
+    }
 }
 
 // ---------------------------------------------------------------------------

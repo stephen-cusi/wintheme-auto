@@ -48,6 +48,7 @@ pub const ID_EDIT_DARK: u32 = 4002;
 pub const ID_BTN_SAVE_TIME: u32 = 4003;
 
 pub const ID_CHK_AUTOSTART: u32 = 5001;
+pub const ID_CHK_START_MINIMIZED: u32 = 5002;
 
 // 基础布局尺寸（按 96 DPI 设计，运行时按 DPI 缩放）
 pub const BASE_W: i32 = 480;
@@ -201,6 +202,25 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         .map(|st| st.cfg.auto_start)
         .unwrap_or(true);
     make_checkbox(parent, hinst, ID_CHK_AUTOSTART, mx, y, s(220), s(24), "开机自动启动", auto_start);
+    y += s(28);
+
+    // ---- 开机自启的"静默"复选框：登录时进托盘，不弹主窗口 ----
+    let start_minimized = APP_STATE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|st| st.cfg.start_minimized)
+        .unwrap_or(true);
+    make_checkbox(
+        parent,
+        hinst,
+        ID_CHK_START_MINIMIZED,
+        mx + s(20),
+        y,
+        s(260),
+        s(24),
+        "  └ 开机时只在托盘后台运行（不弹主窗口）",
+        start_minimized,
+    );
     y += s(30);
 
     // ---- 定时模式：时间编辑区（紧凑单行，三个元素横排）----
@@ -254,7 +274,7 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     let btn_w = col_w;
     let col2_x = mx + btn_w + gap_x;
     make_button(parent, hinst, ID_BTN_TOGGLE, mx, y, btn_w, btn_h, "立即切换主题");
-    make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "立即检查");
+    make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "重新获取位置");
     y += btn_h + s(10);
     make_button(parent, hinst, ID_BTN_CYCLE_MODE, mx, y, btn_w, btn_h, "切换模式");
     make_button(parent, hinst, ID_BTN_OPEN_CFG, col2_x, y, btn_w, btn_h, "打开配置文件");
@@ -506,6 +526,13 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
         const BM_SETCHECK: u32 = 0x00F1;
         let w: usize = if cfg.auto_start { 1 } else { 0 };
+        SendMessageW(h, BM_SETCHECK, w, 0);
+    }
+    // 开机静默启动复选框：与配置同步
+    if let Some(h) = hwnd_opt(hwnd, ID_CHK_START_MINIMIZED) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        const BM_SETCHECK: u32 = 0x00F1;
+        let w: usize = if cfg.start_minimized { 1 } else { 0 };
         SendMessageW(h, BM_SETCHECK, w, 0);
     }
 

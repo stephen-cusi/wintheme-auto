@@ -126,8 +126,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.iter().any(|a| a == "--install") {
-        config::install_startup(&exe)?;
-        emit("已写入开机启动注册表项，程序将在登录时自动运行。");
+        // --install 显式以"静默"模式写注册表（用户主动装自启时不会想每次登录都被弹窗）
+        config::install_startup(&exe, true)?;
+        emit("已写入开机启动注册表项，登录后将在托盘中静默运行（不再弹主窗口）。");
     }
 
     // 单实例：互斥体已存在（错误码 183 = ERROR_ALREADY_EXISTS）即说明已有实例在运行。
@@ -152,7 +153,9 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = config::load()?;
     if cfg.auto_start && !args.iter().any(|a| a == "--no-autostart") {
-        let _ = config::install_startup(&exe);
+        // 写注册表时带上 --silent 标志，登录后程序在托盘里静默常驻，不弹主窗口。
+        // （用户想"开机就看到主窗口"的话，可以在主窗口的"开机自启"下方关掉 start_minimized。）
+        let _ = config::install_startup(&exe, cfg.start_minimized);
     }
 
     let state = AppState {
@@ -167,8 +170,9 @@ fn main() -> anyhow::Result<()> {
         .set(Arc::new(Mutex::new(state)))
         .map_err(|_| anyhow!("APP_STATE 已初始化"))?;
 
-    if args.iter().any(|a| a == "--tray-only") {
-        // 仅托盘模式（保留旧行为）
+    if args.iter().any(|a| a == "--tray-only" || a == "--silent") {
+        // --silent: 开机自启时由注册表 Run 项带入此参数，意图是"不要弹主窗口"。
+        // --tray-only: 保留的旧行为，行为一致。
         run_tray_only()?;
     } else {
         // 默认：标准 GUI 主窗口 + 系统托盘
@@ -404,9 +408,9 @@ unsafe extern "system" fn wnd_proc(
                     refresh_ui(hwnd);
                 }
                 gui::ID_BTN_CHECK => {
-                    // 立即检查：重新评估主题；刷新信息行让结果可见。
-                    // 若坐标未知会触发后台定位，标签会显示“正在后台获取...”。
-                    handle_menu_cmd(hwnd, ID_CHECK);
+                    // 立即刷新：丢弃内存 + 磁盘上的位置缓存，强制重新获取。
+                    // 通常用于：①位置信息被锁/换城市后；②想看新一次 fetch 的来源日志。
+                    force_reload_location_and_tick(hwnd);
                     refresh_ui(hwnd);
                 }
                 gui::ID_BTN_OPEN_CFG => handle_menu_cmd(hwnd, ID_CONFIG),
@@ -441,6 +445,13 @@ unsafe extern "system" fn wnd_proc(
                     if ((_wparam >> 16) as u32) == 0 {
                         // BN_CLICKED：切换开机自启
                         on_autostart_clicked(hwnd);
+                        refresh_ui(hwnd);
+                    }
+                }
+                gui::ID_CHK_START_MINIMIZED => {
+                    if ((_wparam >> 16) as u32) == 0 {
+                        // BN_CLICKED：切换"开机时只在托盘后台运行"
+                        on_start_minimized_clicked(hwnd);
                         refresh_ui(hwnd);
                     }
                 }
@@ -797,13 +808,82 @@ unsafe fn on_autostart_clicked(hwnd: HWND) {
         st.cfg.auto_start = on;
         let _ = config::save(&st.cfg);
         if on {
-            let _ = config::install_startup(&exe);
-            log("开机自启已开启（写注册表 Run 项）");
+            // 写注册表时按 cfg.start_minimized 决定是否带 --silent
+            let _ = config::install_startup(&exe, st.cfg.start_minimized);
+            log(&format!(
+                "开机自启已开启（写注册表 Run 项，start_minimized={}）",
+                st.cfg.start_minimized
+            ));
         } else {
             let _ = config::uninstall_startup();
             log("开机自启已关闭（移除注册表 Run 项）");
         }
     }
+}
+
+/// 开机静默启动复选框被点击：翻转 cfg.start_minimized 持久化。
+/// 如果当前已写注册表自启，会同步更新注册表项的 --silent 标志。
+unsafe fn on_start_minimized_clicked(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, SendMessageW};
+    const BM_GETCHECK: u32 = 0x00F0;
+    let chk = GetDlgItem(hwnd, gui::ID_CHK_START_MINIMIZED as i32);
+    if chk == 0 {
+        return;
+    }
+    let on = SendMessageW(chk, BM_GETCHECK, 0, 0) == 1;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(s) = APP_STATE.get() {
+        let mut st = s.lock().unwrap();
+        st.cfg.start_minimized = on;
+        let _ = config::save(&st.cfg);
+        // 如果自启已开，把注册表项的 --silent 同步一下（避免选项改了但下次登录仍按旧值启动）
+        if st.cfg.auto_start {
+            let _ = config::install_startup(&exe, on);
+        }
+        log(&format!("开机静默启动 = {}（已持久化）", on));
+    }
+}
+
+/// 主窗口的"立即检查"按钮：丢弃已缓存的位置（内存 + 磁盘），强制重新走一次
+/// "系统位置 / IP fallback" 流程，再触发一次 tick 让当前主题按新坐标重新评估。
+///
+/// 典型用途：
+/// - 第一次 IP 失败后想手动重试一次（IP 是 5s 超时，可能临时网络问题）
+/// - 改完 latitude/longitude 配置后想立即生效（清掉旧 coords 后再 tick）
+/// - 想看 fetch 来源日志（IP 还是 WinRT）来确认现在走的哪条路径
+fn force_reload_location_and_tick(hwnd: HWND) {
+    // 1) 清内存坐标 + sun 缓存
+    if let Some(s) = APP_STATE.get() {
+        if let Ok(mut st) = s.lock() {
+            st.coords = None;
+            st.sun_cache = None;
+            st.sun_cache_date = None;
+        }
+    }
+    // 2) 删磁盘 cache，下次 ensure_coords 会重新走网络
+    let cache_path = config::config_dir().join("coords.cache");
+    if cache_path.exists() {
+        if let Err(e) = std::fs::remove_file(&cache_path) {
+            log(&format!("删除位置缓存失败（{e}）— 继续执行"));
+        } else {
+            log("已清除位置缓存，强制重新获取");
+        }
+    } else {
+        log("磁盘无位置缓存，立即重新获取");
+    }
+    // 3) 立即 tick（不等待定时器）：根据新坐标重新评估主题
+    if let Some(s) = APP_STATE.get() {
+        if let Ok(mut st) = s.lock() {
+            if let Err(e) = tick(&mut st) {
+                log(&format!("tick 错误: {e}"));
+            }
+        }
+    }
+    // 4) 立即强制刷新一次 UI（在 fetch 还没回来时显示"正在后台获取..."）
+    unsafe { refresh_ui(hwnd) };
+    log("已触发位置重取与主题重新评估（后台完成会自动再刷一次）");
 }
 
 // ---------------------------------------------------------------------------
