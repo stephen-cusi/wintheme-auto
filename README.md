@@ -1,5 +1,7 @@
 # WinTheme Auto — Windows 11 浅色/深色主题自动切换器
 
+[![build](https://github.com/stephen-cusi/wintheme-auto/actions/workflows/build.yml/badge.svg)](https://github.com/stephen-cusi/wintheme-auto/actions/workflows/build.yml)
+
 用 Rust 编写，零运行时依赖（纯 Win32 API），支持两种切换方式，并可在登录时自动启动。
 
 ## 功能
