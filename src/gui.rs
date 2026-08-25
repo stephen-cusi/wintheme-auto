@@ -268,11 +268,12 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     // ---- 定时模式：时间编辑区（紧凑单行，三个元素横排）----
     let row_h = s(26);
     const SS_CENTERIMAGE: u32 = 0x0200;
-    let label_w = s(78);
-    let edit_w = s(72);
-    let save_w = s(76);
-    let label_dark_w = s(78);
+    let label_w = s(76);
+    let edit_w = s(70);
+    let save_w = s(72);
+    let gap = s(12); // 相邻元素统一间距，保证对齐
 
+    // 两个"标签：输入框"组：等宽左对齐标签 + 同宽输入框 + 均匀间距
     let lx1 = mx;
     make_static(
         parent,
@@ -285,10 +286,10 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         row_h,
         "浅色时刻:",
     );
-    let ex1 = lx1 + label_w + s(8);
-    make_edit(parent, hinst, ID_EDIT_LIGHT, ex1, y, edit_w, row_h);
+    let ex1 = lx1 + label_w + gap;
+    make_edit(parent, hinst, ID_EDIT_LIGHT, ex1, y + s(2), edit_w, row_h);
 
-    let lx2 = ex1 + edit_w + s(16);
+    let lx2 = ex1 + edit_w + gap;
     make_static(
         parent,
         hinst,
@@ -296,14 +297,14 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         SS_LEFT | SS_CENTERIMAGE,
         lx2,
         y,
-        label_dark_w,
+        label_w,
         row_h,
         "深色时刻:",
     );
-    let ex2 = lx2 + label_dark_w + s(8);
-    make_edit(parent, hinst, ID_EDIT_DARK, ex2, y, edit_w, row_h);
+    let ex2 = lx2 + label_w + gap;
+    make_edit(parent, hinst, ID_EDIT_DARK, ex2, y + s(2), edit_w, row_h);
 
-    let bx = ex2 + edit_w + s(16);
+    let bx = ex2 + edit_w + gap;
     make_button(parent, hinst, ID_BTN_SAVE_TIME, bx, y, save_w, row_h, "保存");
     y += s(36);
 
@@ -412,11 +413,12 @@ unsafe fn make_checkbox(
     text: &str,
     checked: bool,
 ) -> HWND {
-    const BS_AUTOCHECKBOX: u32 = 0x0003;
     const BM_SETCHECK: u32 = 0x00F1;
     const BST_CHECKED: usize = 1;
     let t = w(text);
-    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_AUTOCHECKBOX;
+    // 自绘复选框：替代 BS_AUTOCHECKBOX，由主窗口 wnd_proc 的 WM_DRAWITEM 绘制，
+    // 让勾选框 + 文字都跟随主题(深色下文字不再变黑)。点击后由 WM_COMMAND 手动翻转勾选。
+    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | raw::BS_OWNERDRAW;
     let h = CreateWindowExW(
         0,
         w("BUTTON").as_ptr(),

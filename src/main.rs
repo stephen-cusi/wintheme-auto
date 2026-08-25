@@ -26,24 +26,25 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, DrawTextW, FillRect, GetDC,
-    GetStockObject, GetTextExtentPoint32W, HDC, HGDIOBJ, InvalidateRect, ReleaseDC, SetBkColor,
-    SetBkMode, SetTextColor, SelectObject,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FillRgn, GetDC,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient, SetBkColor, SetBkMode,
+    SetTextColor, SelectObject,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW,
-    DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, InsertMenuItemW, LoadCursorW,
-    MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MFT_SEPARATOR,
-    MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MF_SEPARATOR, MF_STRING, MessageBoxW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_QUIT, WM_SETFONT, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
+    CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
+    EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW, GetWindowTextLengthW,
+    GetWindowTextW, IDC_ARROW, InsertMenuItemW, LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
+    MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW,
+    HWND_MESSAGE, IDC_HAND,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED,
     ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_BUTTON, ODT_MENU,
@@ -133,6 +134,9 @@ fn main() -> anyhow::Result<()> {
     let silent = args.iter().any(|a| a == "--silent");
 
     let cfg = config::load()?;
+    // 启动时把配置同步到自绘复选框状态
+    CHK_AUTOSTART.store(cfg.auto_start, Ordering::Relaxed);
+    CHK_START_MINIMIZED.store(cfg.start_minimized, Ordering::Relaxed);
     if cfg.auto_start {
         // 写注册表时带上 --silent 标志，登录后程序在托盘里静默常驻，不弹主窗口。
         // (用户想"开机就看到主窗口"的话，可以在主窗口的"开机自启"下方关掉 start_minimized。)
@@ -330,6 +334,14 @@ unsafe extern "system" fn wnd_proc(
             SetTextColor(hdc, text_color());
             win_brush()
         }
+        // 复选框/单选标签：文字跟随主题(否则深色模式下仍是黑字)
+        0x0135 => { // WM_CTLCOLORBTN
+            let hdc = _wparam as isize;
+            SetBkMode(hdc, 2); // OPAQUE
+            SetBkColor(hdc, bg_color());
+            SetTextColor(hdc, text_color());
+            win_brush()
+        }
         // 输入框：与应用主题一致
         0x0133 => { // WM_CTLCOLOREDIT
             let hdc = _wparam as isize;
@@ -351,6 +363,10 @@ unsafe extern "system" fn wnd_proc(
             let dis = &*(lparam as *const DRAWITEMSTRUCT);
             if dis.CtlType == ODT_MENU {
                 draw_menu_item(lparam)
+            } else if dis.CtlID == gui::ID_CHK_AUTOSTART
+                || dis.CtlID == gui::ID_CHK_START_MINIMIZED
+            {
+                draw_owner_checkbox(dis)
             } else {
                 draw_owner_button(lparam)
             }
@@ -452,16 +468,18 @@ unsafe extern "system" fn wnd_proc(
                 }
                 gui::ID_CHK_AUTOSTART => {
                     if ((_wparam >> 16) as u32) == 0 {
-                        // BN_CLICKED：切换开机自启
+                        // BN_CLICKED：翻转勾选并切换开机自启
+                        toggle_checkbox(hwnd, gui::ID_CHK_AUTOSTART);
                         on_autostart_clicked(hwnd);
-                        refresh_ui(hwnd);
+                        // 只同步"静默"子选项显隐，不整窗刷新(避免图标/文字闪烁)
+                        sync_sub_checkbox_visibility(hwnd);
                     }
                 }
                 gui::ID_CHK_START_MINIMIZED => {
                     if ((_wparam >> 16) as u32) == 0 {
-                        // BN_CLICKED：切换"开机时只在托盘后台运行"
+                        // BN_CLICKED：翻转"开机时只在托盘后台运行"
+                        toggle_checkbox(hwnd, gui::ID_CHK_START_MINIMIZED);
                         on_start_minimized_clicked(hwnd);
-                        refresh_ui(hwnd);
                     }
                 }
                 _ => {}
@@ -497,12 +515,17 @@ unsafe extern "system" fn wnd_proc(
 static IS_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
 const GWLP_USERDATA: i32 = -21;
 
+// 自绘复选框的勾选状态(自己维护，不依赖系统 BM_GETCHECK，避免 owner-draw 语义不一致)。
+// 启动时从 cfg 同步；点击时由 toggle_checkbox 翻转，同时写回 cfg(start_auto / start_minimized)。
+static CHK_AUTOSTART: AtomicBool = AtomicBool::new(true);
+static CHK_START_MINIMIZED: AtomicBool = AtomicBool::new(true);
+
 // ---- 界面配色：由应用自己的主题判断(is_dark)决定，深浅色各一套，保证可读且一致 ----
 const BG_LIGHT: u32 = 0x00F2F2F2; // 浅色窗口背景
 const TEXT_LIGHT: u32 = 0x001E1E1E; // 浅色正文
 const EDIT_LIGHT: u32 = 0x00FFFFFF; // 浅色输入框
 const BG_DARK: u32 = 0x001F1F1F; // 深色窗口背景
-const TEXT_DARK: u32 = 0x00E8E8E8; // 深色正文
+const TEXT_DARK: u32 = 0x00F2F2F2; // 深色正文
 const EDIT_DARK: u32 = 0x002D2D2D; // 深色输入框(略亮于背景，便于辨认)
 
 // 自绘按钮颜色(深色主题下"凸"于 #1F1F1F 背景；浅色主题下深度更深的灰，比 #F2F2F2 深)
@@ -514,6 +537,9 @@ const BTN_HOVER_DARK: u32 = 0x003F3F3F; // 深色按钮悬停
 const BTN_PRESSED_DARK: u32 = 0x001A1A1A; // 深色按钮按下
 const BTN_TEXT_DISABLED: u32 = 0x00808080; // 禁用文字
 const BTN_BORDER: u32 = 0x00808080; // 焦点边框
+const CHK_ACCENT: u32 = 0x00D77800; // 复选框勾选的强调蓝 RGB(0,120,215)，COLORREF 字节序 BBGGRR
+const CHK_BOX_BORDER_DARK: u32 = 0x009A9A9A; // 深色下未勾选框边框
+const CHK_BOX_BORDER_LIGHT: u32 = 0x00808080; // 浅色下未勾选框边框
 
 /// 当前是否为深色主题(跟应用切换的主题一致)。
 fn is_dark() -> bool {
@@ -644,6 +670,83 @@ unsafe fn draw_owner_button(lparam: LPARAM) -> LRESULT {
         DrawFocusRect(hdc, &rc);
     }
 
+    1
+}
+
+/// 自绘复选框绘制(处理主窗口 WM_DRAWITEM，勾选框 + 文字都跟随主题)。
+/// 返回 nonzero = 已处理该消息。
+unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreatePen, LineTo, MoveToEx, RoundRect, PS_SOLID,
+    };
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+
+    // 背景：跟窗口一致，避免露出默认按钮底色
+    let bgbr = CreateSolidBrush(bg_color());
+    FillRect(hdc, &rc, bgbr);
+    DeleteObject(bgbr);
+
+    // 勾选状态：读自维护状态(owner-draw 的 BM_GETCHECK 语义不可靠)
+    let checked = chk_state(dis.CtlID);
+
+    // 取文本
+    let len = GetWindowTextLengthW(dis.hwndItem);
+    let mut buf: Vec<u16> = vec![0u16; len as usize + 1];
+    let n = GetWindowTextW(dis.hwndItem, buf.as_mut_ptr(), buf.len() as i32);
+
+    let cy = (rc.bottom - rc.top) as f32;
+    let box_sz = ((cy - 6.0).max(14.0).min(22.0)) as i32;
+    let box_x = rc.left + 2;
+    let box_y = rc.top + (rc.bottom - rc.top - box_sz) / 2;
+    let r = (box_sz as f32 * 0.25) as i32; // 圆角半径
+
+    if checked {
+        // 蓝底圆角 + 白勾
+        let br = CreateSolidBrush(CHK_ACCENT);
+        let pen = CreatePen(PS_SOLID, 1, CHK_ACCENT);
+        let oldbr = SelectObject(hdc, br);
+        let oldpen = SelectObject(hdc, pen);
+        RoundRect(hdc, box_x, box_y, box_x + box_sz, box_y + box_sz, r, r);
+        SelectObject(hdc, oldbr);
+        SelectObject(hdc, oldpen);
+        DeleteObject(br);
+        DeleteObject(pen);
+
+        let cpen = CreatePen(PS_SOLID, 2, 0x00FFFFFF);
+        let oldcpen = SelectObject(hdc, cpen);
+        let mut p: POINT = std::mem::zeroed();
+        let (x0, y0, s) = (box_x as f32, box_y as f32, box_sz as f32);
+        // 画一个勾：起点 -> 折角 -> 终点
+        MoveToEx(hdc, (x0 + s * 0.22) as i32, (y0 + s * 0.53) as i32, &mut p);
+        LineTo(hdc, (x0 + s * 0.42) as i32, (y0 + s * 0.73) as i32);
+        LineTo(hdc, (x0 + s * 0.80) as i32, (y0 + s * 0.27) as i32);
+        SelectObject(hdc, oldcpen);
+        DeleteObject(cpen);
+    } else {
+        // 空框：填充 + 边框
+        let br = CreateSolidBrush(edit_color());
+        let border = if is_dark() { CHK_BOX_BORDER_DARK } else { CHK_BOX_BORDER_LIGHT };
+        let pen = CreatePen(PS_SOLID, 1, border);
+        let oldbr = SelectObject(hdc, br);
+        let oldpen = SelectObject(hdc, pen);
+        RoundRect(hdc, box_x, box_y, box_x + box_sz, box_y + box_sz, r, r);
+        SelectObject(hdc, oldbr);
+        SelectObject(hdc, oldpen);
+        DeleteObject(br);
+        DeleteObject(pen);
+    }
+
+    // 文字(theme 色，单行垂直居中)
+    if n > 0 {
+        SetBkMode(hdc, 1); // TRANSPARENT
+        SetTextColor(hdc, text_color());
+        let mut tr = rc;
+        tr.left = box_x + box_sz + 6;
+        tr.right = rc.right - 2;
+        // DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+        DrawTextW(hdc, buf.as_ptr(), n, &mut tr, 0x0860);
+    }
     1
 }
 
@@ -790,14 +893,8 @@ unsafe fn save_schedule_time_from_edits(hwnd: HWND) {
 }
 
 /// 开机自启复选框被点击：按当前勾选状态写入/移除开机启动，并保存配置。
-unsafe fn on_autostart_clicked(hwnd: HWND) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, SendMessageW};
-    const BM_GETCHECK: u32 = 0x00F0;
-    let chk = GetDlgItem(hwnd, gui::ID_CHK_AUTOSTART as i32);
-    if chk == 0 {
-        return;
-    }
-    let on = SendMessageW(chk, BM_GETCHECK, 0, 0) == 1;
+unsafe fn on_autostart_clicked(_hwnd: HWND) {
+    let on = chk_state(gui::ID_CHK_AUTOSTART);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -838,8 +935,10 @@ unsafe fn show_about_dialog(parent: HWND) {
     GetClientRect(parent, &mut parent_rc);
     let mut pp: POINT = std::mem::zeroed();
     ClientToScreen(parent, &mut pp);
-    let ww: i32 = 420;
-    let wh: i32 = 320;
+    // 按 DPI 缩放窗口尺寸，避免高分屏下文字溢出
+    let scale = gui::dpi_scale_for_window(parent);
+    let ww: i32 = (450.0 * scale).round() as i32;
+    let wh: i32 = (520.0 * scale).round() as i32;
     let x = pp.x + (parent_rc.right - parent_rc.left - ww) / 2;
     let y = pp.y + (parent_rc.bottom - parent_rc.top - wh) / 2;
     let hwnd = CreateWindowExW(
@@ -856,20 +955,10 @@ unsafe fn show_about_dialog(parent: HWND) {
         return;
     }
 
-    // 模态对话框：禁用父窗口，只为 about 窗口跑局部消息循环。
-    // 用 GetMessageW(hwnd) 过滤，窗口销毁后自然返回 0 退出循环。
-    // 用 SendMessage(WM_ENABLE) 替代 EnableWindow（后者在 windows-sys 0.52 模块位置不同）。
-    SendMessageW(parent, 0x000A /* WM_ENABLE */, 0, 0);
+    // 非模态：不禁用父窗口，也不跑局部消息循环。about 有独立 wnd_proc，
+    // 主窗口的消息循环会照常把它的消息派发过去，因此主窗口可正常交互，不会“点了卡死”。
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
-    let mut msg: MSG = std::mem::zeroed();
-    while GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-    SendMessageW(parent, 0x000A /* WM_ENABLE */, 1, 0);
-    SetForegroundWindow(parent);
-    let _ = DestroyWindow(hwnd);
 }
 /// 注册 "WinthemeAboutClass" 窗口类（独立于主窗口，避免 class 复用导致 wnd_proc 误判）。
 unsafe fn register_about_class() -> u16 {
@@ -896,14 +985,15 @@ unsafe extern "system" fn about_wnd_proc(
     const ID_OK: u32 = 100;
     match msg {
         0x0001 /* WM_CREATE */ => {
-            // "关闭"按钮(自绘，跟主窗口按钮风格一致)
+            // "关闭"按钮(自绘，跟主窗口按钮风格一致)，随 DPI 缩放并加大
             let hinst = GetModuleHandleW(ptr::null());
-            let btn_w = 100;
-            let btn_h = 32;
+            let scale = crate::gui::dpi_scale_for_window(hwnd);
+            let btn_w = (140.0 * scale).round() as i32;
+            let btn_h = (44.0 * scale).round() as i32;
             // 居中放底部
             let r = get_window_rect_content(hwnd);
             let x = (r.right - r.left - btn_w) / 2;
-            let y = (r.bottom - r.top) - btn_h - 16;
+            let y = (r.bottom - r.top) - btn_h - (16.0 * scale) as i32;
             let btn = CreateWindowExW(
                 0,
                 widestring("BUTTON").as_ptr(),
@@ -916,12 +1006,16 @@ unsafe extern "system" fn about_wnd_proc(
                 ptr::null(),
             );
             // 复用主窗口 UI 字体
-            let f = crate::gui::ui_font(crate::gui::dpi_scale_for_window(hwnd));
+            let f = crate::gui::ui_font(scale);
             if f != 0 {
                 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
                 use windows_sys::Win32::Foundation::WPARAM;
                 SendMessageW(btn, WM_SETFONT, f as WPARAM, 1);
             }
+            // 标题栏跟随主题(深/浅色)，避免深色模式下标题栏还是白色
+            apply_titlebar_theme(hwnd);
+            // 应用窗口图标(标题栏/任务栏)
+            apply_app_icon(hwnd);
             0
         }
         0x0002 /* WM_DESTROY */ => {
@@ -937,19 +1031,14 @@ unsafe extern "system" fn about_wnd_proc(
             // 跟主窗口按钮同款自绘逻辑
             draw_owner_button(lparam)
         }
-        0x0009 /* WM_PAINT */ => {
+        0x000F /* WM_PAINT */ => {
             paint_about(hwnd);
             0
         }
         0x0111 /* WM_COMMAND */ => {
             let id = (wparam as u32) & 0xFFFF;
             if id == ID_OK {
-                // 把主窗口 enable 回来（非模态的副效应补偿）
-                use windows_sys::Win32::UI::WindowsAndMessaging::GetParent;
-                let parent = GetParent(hwnd);
-                if parent != 0 {
-                    PostMessageW(parent, 0x000A, 1, 0);  // WM_ENABLE = 1
-                }
+                // 非模态：直接关掉自己即可，主窗口本就可用
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -961,6 +1050,45 @@ unsafe extern "system" fn about_wnd_proc(
                 return 0;
             }
             0
+        }
+         0x0200 /* WM_MOUSEMOVE */ => {
+            // 悬停在"仓库"链接行上：变色 + 手型光标；离开时还原
+            let over = about_link_hit(hwnd);
+            if over != ABOUT_LINK_HOVER.swap(over, Ordering::Relaxed) {
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            // 注册鼠标离开通知
+            let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
+            tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+            tme.dwFlags = 0x0002; // TME_LEAVE
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&mut tme);
+            return 0;
+        }
+         0x02A3 /* WM_MOUSELEAVE */ => {
+            if ABOUT_LINK_HOVER.swap(false, Ordering::Relaxed) {
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+            return 0;
+        }
+         0x0020 /* WM_SETCURSOR */ => {
+            if about_link_hit(hwnd) {
+                SetCursor(LoadCursorW(0, IDC_HAND));
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+         0x0201 /* WM_LBUTTONDOWN */ => {
+            // 点击"仓库"链接行 → 用默认浏览器打开
+            let x = (lparam as u32 & 0xFFFF) as i16 as i32;
+            let y = ((lparam as u32 >> 16) & 0xFFFF) as i16 as i32;
+            let pt = POINT { x, y };
+            if let Some(r) = *about_link_rect().lock().unwrap() {
+                if pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom {
+                    open_url("https://github.com/stephen-cusi/wintheme-auto");
+                }
+            }
+            return 0;
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -977,7 +1105,8 @@ unsafe fn get_window_rect_content(hwnd: HWND) -> RECT {
 /// "关于"对话框自绘文字
 unsafe fn paint_about(hwnd: HWND) {
     use windows_sys::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, DrawTextW, FillRect, SetBkMode, SetTextColor, PAINTSTRUCT,
+        BeginPaint, EndPaint, DrawTextW, FillRect, GetTextMetricsW, SelectObject, SetBkMode,
+        SetTextColor, TEXTMETRICW, PAINTSTRUCT,
     };
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
@@ -987,21 +1116,23 @@ unsafe fn paint_about(hwnd: HWND) {
     let rc = get_window_rect_content(hwnd);
     // 显式按主题填充背景，否则 BEGINPAINT 可能不清屏，导致黑底 + 深色字不可见
     FillRect(hdc, &rc, win_brush());
+    // 按 DPI 缩放文字(选统一 UI 字体)与布局，避免高分屏下溢出
+    let scale = gui::dpi_scale_for_window(hwnd);
+    let old_font = SelectObject(hdc, gui::ui_font(scale));
     let version = env!("CARGO_PKG_VERSION");
     // 文字：先居中标题("WinTheme Auto")，再列各字段
     let title_w = widestring(&format!("WinTheme Auto v{version}"));
     let mut title_rc = rc;
-    title_rc.left += 16;
-    title_rc.right -= 16;
-    title_rc.top += 24;
-    title_rc.bottom = title_rc.top + 36;
+    title_rc.left += (16.0 * scale) as i32;
+    title_rc.right -= (16.0 * scale) as i32;
+    title_rc.top += (24.0 * scale) as i32;
+    title_rc.bottom = title_rc.top + (36.0 * scale) as i32;
     SetBkMode(hdc, 1); // TRANSPARENT
     SetTextColor(hdc, if is_dark() { 0xFFFFFF } else { 0x1E1E1E });
-    // 0x0024 = DT_CENTER(0x0001) | DT_SINGLELINE(0x0020) | DT_VCENTER(0x0004) 是错的
-    // 0x0025 = 0x0001 | 0x0004 | 0x0020 = CENTER | VCENTER | SINGLELINE  对
+    // 0x0025 = CENTER | VCENTER | SINGLELINE
     DrawTextW(hdc, title_w.as_ptr(), title_w.len() as i32, &mut title_rc, 0x0025);
 
-    // body 文本：按行写
+    // body 文本：逐行绘制，方便把「仓库」那一行做成可点击链接
     let lines: Vec<String> = vec![
         "Windows 11 浅色/深色主题自动切换器".to_string(),
         "".to_string(),
@@ -1015,30 +1146,119 @@ unsafe fn paint_about(hwnd: HWND) {
         "协议：MIT License".to_string(),
         "".to_string(),
         "原生 Win32 + Rust 编写，零额外运行时依赖。".to_string(),
+        "采用 vibe coding 方式开发。".to_string(),
     ];
-    SetTextColor(hdc, if is_dark() { 0xE8E8E8 } else { 0x1E1E1E });
-    let mut body_rc = rc;
-    body_rc.left += 20;
-    body_rc.right -= 20;
-    body_rc.top += 70;
-    body_rc.bottom = rc.bottom - 60; // 留空间给底部按钮
-    let joined = lines.join("\n");
-    let body_w = widestring(&joined);
-    // 0x0008 = DT_LEFT
-    DrawTextW(hdc, body_w.as_ptr(), body_w.len() as i32, &mut body_rc, 0x0008);
+    let body_color = if is_dark() { 0xFFFFFFu32 } else { 0x1E1E1Eu32 };
+    let link_color = if is_dark() { 0x6FB3FFu32 } else { 0x0059C8u32 };
+    let link_color_hover = if is_dark() { 0x8FC7FFu32 } else { 0x0A7AF0u32 };
+    let link_hover = ABOUT_LINK_HOVER.load(Ordering::Relaxed);
+    let body_left = rc.left + (20.0 * scale) as i32;
+    let body_right = rc.right - (20.0 * scale) as i32;
+    let mut ty = rc.top + (70.0 * scale) as i32;
+    let mut tm: TEXTMETRICW = std::mem::zeroed();
+    GetTextMetricsW(hdc, &mut tm);
+    let lh = (tm.tmHeight as i32).max(20);
+    for line in &lines {
+        let mut lr = RECT { left: body_left, top: ty, right: body_right, bottom: ty + lh };
+        let is_link = line.contains("github.com");
+        if is_link {
+            SetTextColor(hdc, if link_hover { link_color_hover } else { link_color });
+        } else {
+            SetTextColor(hdc, body_color);
+        }
+        let lw = widestring(line);
+        // DT_SINGLELINE | DT_NOPREFIX（悬停时加 DT_UNDERLINE）
+        let mut dt = 0x0020 | 0x0800;
+        if is_link && link_hover {
+            dt |= 0x0200;
+        }
+        DrawTextW(hdc, lw.as_ptr(), lw.len() as i32, &mut lr, dt);
+        if is_link {
+            *about_link_rect().lock().unwrap() = Some(lr);
+        }
+        SetTextColor(hdc, body_color);
+        ty += lh;
+    }
+    SelectObject(hdc, old_font);
     let _ = EndPaint(hwnd, &mut ps);
+}
+
+/// 保存"仓库"链接行在关于窗口里的客户端矩形，供点击检测用。
+fn about_link_rect() -> &'static std::sync::Mutex<Option<RECT>> {
+    use std::sync::OnceLock;
+    static R: OnceLock<std::sync::Mutex<Option<RECT>>> = OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 关于窗口"仓库"链接是否处于鼠标悬停(用于变色 + 点击手型光标)。
+static ABOUT_LINK_HOVER: AtomicBool = AtomicBool::new(false);
+
+/// 鼠标当前是否落在"仓库"链接矩形上(客户端坐标)。
+unsafe fn about_link_hit(hwnd: HWND) -> bool {
+    let Some(r) = *about_link_rect().lock().unwrap() else {
+        return false;
+    };
+    let mut p = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut p);
+    ScreenToClient(hwnd, &mut p);
+    p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom
+}
+
+/// 用默认浏览器打开网址。
+unsafe fn open_url(url: &str) {
+    let verb_us: Vec<u16> = widestring("open");
+    let url_w: Vec<u16> = widestring(url);
+    ShellExecuteW(0, verb_us.as_ptr(), url_w.as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
+}
+
+/// 取指定复选框当前是否勾选(读自维护的状态)。
+fn chk_state(id: u32) -> bool {
+    match id {
+        gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.load(Ordering::Relaxed),
+        gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.load(Ordering::Relaxed),
+        _ => false,
+    }
+}
+
+/// 翻转自绘复选框的勾选状态(自维护状态 + 同步系统 BM_SETCHECK + 重绘)。
+unsafe fn toggle_checkbox(hwnd: HWND, id: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, SendMessageW};
+    const BM_SETCHECK: u32 = 0x00F1;
+    const BST_CHECKED: usize = 1;
+    let new = !chk_state(id);
+    match id {
+        gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.store(new, Ordering::Relaxed),
+        gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.store(new, Ordering::Relaxed),
+        _ => {}
+    }
+    let h = GetDlgItem(hwnd, id as i32);
+    if h != 0 {
+        SendMessageW(h, BM_SETCHECK, if new { BST_CHECKED } else { 0 }, 0);
+        // 局部重绘复选框本身(不整窗刷新)，并同步上屏，避免点击反馈被后续 I/O 拖慢
+        InvalidateRect(h, ptr::null(), 1);
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        UpdateWindow(h);
+    }
+}
+
+/// "开机时只在托盘后台运行"子选项：跟随 auto_start 显示/隐藏(只动它，不触发整窗刷新)。
+unsafe fn sync_sub_checkbox_visibility(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, ShowWindow};
+    let show = APP_STATE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|st| st.cfg.auto_start)
+        .unwrap_or(false);
+    let h = GetDlgItem(hwnd, gui::ID_CHK_START_MINIMIZED as i32);
+    if h != 0 {
+        ShowWindow(h, if show { 5 } else { 0 }); // 5=SW_SHOW, 0=SW_HIDE
+    }
 }
 
 /// 开机静默启动复选框被点击：翻转 cfg.start_minimized 持久化。
 /// 如果当前已写注册表自启，会同步更新注册表项的 --silent 标志。
-unsafe fn on_start_minimized_clicked(hwnd: HWND) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, SendMessageW};
-    const BM_GETCHECK: u32 = 0x00F0;
-    let chk = GetDlgItem(hwnd, gui::ID_CHK_START_MINIMIZED as i32);
-    if chk == 0 {
-        return;
-    }
-    let on = SendMessageW(chk, BM_GETCHECK, 0, 0) == 1;
+unsafe fn on_start_minimized_clicked(_hwnd: HWND) {
+    let on = chk_state(gui::ID_CHK_START_MINIMIZED);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -1150,15 +1370,13 @@ unsafe fn show_menu(hwnd: HWND) {
         let lock = APP_STATE.get().unwrap().lock().unwrap();
         (lock.cfg.mode.clone(), theme::get_theme().ok())
     };
-    let check = |cond: bool| if cond { "    ✓" } else { "" };
-
     let mut items: Vec<MenuItem> = Vec::new();
-    items.push(MenuItem { id: ID_LIGHT,    text: format!("切换到浅色{}",   check(cur == Some(Theme::Light))),  separator: false, checked: cur == Some(Theme::Light),  enabled: true });
-    items.push(MenuItem { id: ID_DARK,     text: format!("切换到深色{}",   check(cur == Some(Theme::Dark))),   separator: false, checked: cur == Some(Theme::Dark),   enabled: true });
+    items.push(MenuItem { id: ID_LIGHT,    text: "切换到浅色".to_string(), separator: false, checked: cur == Some(Theme::Light),  enabled: true });
+    items.push(MenuItem { id: ID_DARK,     text: "切换到深色".to_string(), separator: false, checked: cur == Some(Theme::Dark),   enabled: true });
     items.push(MenuItem { id: 0,           text: String::new(), separator: true,  checked: false, enabled: true });
-    items.push(MenuItem { id: ID_MODE_SUN, text: format!("模式：跟随日出日落{}", check(mode == "sun")),         separator: false, checked: mode == "sun",        enabled: true });
-    items.push(MenuItem { id: ID_MODE_SCHED, text: format!("模式：定时切换{}",     check(mode == "schedule")),     separator: false, checked: mode == "schedule",   enabled: true });
-    items.push(MenuItem { id: ID_OFF,      text: format!("模式：暂停(手动){}", check(mode == "off")),          separator: false, checked: mode == "off",        enabled: true });
+    items.push(MenuItem { id: ID_MODE_SUN, text: "模式：跟随日出日落".to_string(), separator: false, checked: mode == "sun",        enabled: true });
+    items.push(MenuItem { id: ID_MODE_SCHED, text: "模式：定时切换".to_string(),    separator: false, checked: mode == "schedule",   enabled: true });
+    items.push(MenuItem { id: ID_OFF,      text: "模式：暂停(手动)".to_string(),    separator: false, checked: mode == "off",        enabled: true });
     items.push(MenuItem { id: 0,           text: String::new(), separator: true,  checked: false, enabled: true });
     items.push(MenuItem { id: ID_CHECK,    text: "刷新位置与时区".to_string(), separator: false, checked: false, enabled: true });
     items.push(MenuItem { id: ID_CONFIG,   text: "打开配置文件".to_string(),  separator: false, checked: false, enabled: true });
@@ -1222,31 +1440,54 @@ unsafe fn measure_menu_item(lparam: LPARAM) -> LRESULT {
         mis.itemWidth = 100;
         return 1;
     }
-    mis.itemHeight = 30;
-    // 文字宽度：用 default GUI 字体算
+    mis.itemHeight = menu_item_height();
+    // 文字宽度：用大号菜单字体算
     let hdc = GetDC(0);
     if hdc == 0 {
-        mis.itemWidth = 200;
+        mis.itemWidth = 220;
         return 1;
     }
-    let prev_font = select_font_for_hdc(hdc);
+    let prev_font = SelectObject(hdc, menu_font());
     let text_w: Vec<u16> = items[idx].text.encode_utf16().collect();
     let mut size = SIZE { cx: 0, cy: 0 };
     GetTextExtentPoint32W(hdc, text_w.as_ptr(), text_w.len() as i32, &mut size);
-    select_font_for_hdc_revert(hdc, prev_font);
+    SelectObject(hdc, prev_font);
     ReleaseDC(0, hdc);
-    // 36 (check 区域) + text + 24 (右侧 padding)
-    mis.itemWidth = (size.cx + 60) as u32;
+    // 左侧 check 区域 + 左右 padding
+    mis.itemWidth = (size.cx + 66) as u32;
     1
 }
 
-/// 切换 HDC 当前字体为系统默认 GUI 字体，返回原字体句柄。owner-draw 菜单算文字宽度用。
-unsafe fn select_default_gui_font(hdc: HDC) -> HGDIOBJ {
-    SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT))
+/// 菜单用的大号字体(比 UI 字体更大，营造 Windows 安全中心那种宽松菜单)。
+fn menu_font() -> windows_sys::Win32::Graphics::Gdi::HFONT {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Graphics::Gdi::{CreateFontW, HFONT};
+    static F: OnceLock<HFONT> = OnceLock::new();
+    *F.get_or_init(|| unsafe {
+        let k = gui::dpi_scale_for_system();
+        let name = widestring("Microsoft YaHei UI");
+        CreateFontW(
+            (18.0 * k).round() as i32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x86, // GB2312_CHARSET
+            0,
+            0,
+            0,
+            0,
+            name.as_ptr(),
+        )
+    })
 }
-unsafe fn select_font_for_hdc(hdc: HDC) -> HGDIOBJ { select_default_gui_font(hdc) }
-unsafe fn select_font_for_hdc_revert(hdc: HDC, prev: HGDIOBJ) {
-    SelectObject(hdc, prev);
+
+/// 菜单项高度(随 DPI 缩放)。
+fn menu_item_height() -> u32 {
+    (36.0 * gui::dpi_scale_for_system()).round() as u32
 }
 
 /// 处理 WM_DRAWITEM：自绘菜单项。
@@ -1267,38 +1508,51 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
     let selected = (state & ODS_SELECTED) != 0;
     let grayed   = (state & ODS_DISABLED) != 0;
 
-    // 配色：深浅色两套；选中态背景略亮；disabled 文字更暗
+    // 配色：深浅色两套；悬停/选中画圆角高亮(Defender 风格)；disabled 文字更暗
     let (bg, fg_text) = if is_dark() {
-        if selected { (0x333333u32, 0xFFFFFFu32) } else { (0x1F1F1Fu32, 0xE8E8E8u32) }
+        (0x1F1F1Fu32, 0xE8E8E8u32)
     } else {
-        if selected { (0xCFE3F8u32, 0x000000u32) } else { (0xF2F2F2u32, 0x1E1E1Eu32) }
+        (0xF2F2F2u32, 0x1E1E1Eu32)
     };
     let fg = if grayed { if is_dark() { 0x808080 } else { 0xA0A0A0 } } else { fg_text };
 
-    // 背景
+    // 背景：整格铺纯色(即便弹窗底色偏白，也保证条目是深色)
     let brush = CreateSolidBrush(bg);
     FillRect(hdc, &rc, brush);
     DeleteObject(brush);
 
     if item.separator {
-        // 画一条 1px 横线(深色模式浅灰，浅色模式中灰)
-        let line_color = if is_dark() { 0x4A4A4A } else { 0xC8C8C8 };
-        let mid_y = (rc.top + rc.bottom) / 2;
-        // 2px 粗线，居中在 separator 中点；左右各留 14 像素边距
-        let line_rc = RECT { left: rc.left + 14, top: mid_y - 1, right: rc.right - 14, bottom: mid_y + 1 };
-        let line_brush = CreateSolidBrush(line_color);
-        FillRect(hdc, &line_rc, line_brush);
-        DeleteObject(line_brush);
+        // 去掉显眼的横线/边框：只保留与菜单项一致的背景色，做成无痕迹分隔
         return 1;
     }
+
+    // 悬停/选中：内缩 4px 的圆角高亮(像 Windows 安全中心菜单)
+    if selected {
+        let pad = 4;
+        let hr = RECT {
+            left: rc.left + pad,
+            top: rc.top + pad,
+            right: rc.right - pad,
+            bottom: rc.bottom - pad,
+        };
+        let hl = if is_dark() { 0x3A3A3Au32 } else { 0xD8E4F2u32 };
+        let rgn = CreateRoundRectRgn(hr.left, hr.top, hr.right + 1, hr.bottom + 1, 8, 8);
+        let b = CreateSolidBrush(hl);
+        FillRgn(hdc, rgn, b);
+        DeleteObject(b);
+        DeleteObject(rgn);
+    }
+
+    // 用大号菜单字体画 ✓ 和文字
+    let old_font = SelectObject(hdc, menu_font());
 
     // 左侧 check 区域
     if item.checked {
         // 画一个 ✓(用 Segoe UI Symbol 字符 ✓，U+2713)
         let check_w: Vec<u16> = "\u{2713}".encode_utf16().collect();
         let mut crc = rc;
-        crc.left += 6;
-        crc.right = crc.left + 22;
+        crc.left += 8;
+        crc.right = crc.left + 24;
         SetBkMode(hdc, 1); // TRANSPARENT
         SetTextColor(hdc, fg);
         DrawTextW(hdc, check_w.as_ptr(), check_w.len() as i32, &mut crc, 0x0025);
@@ -1308,11 +1562,13 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
     // 文字
     let text_w: Vec<u16> = item.text.encode_utf16().collect();
     let mut trc = rc;
-    trc.left += 36; // 给 check 区域让位
+    trc.left += 34; // 给 check 区域让位
     trc.right -= 16;
     SetBkMode(hdc, 1);
     SetTextColor(hdc, fg);
     DrawTextW(hdc, text_w.as_ptr(), text_w.len() as i32, &mut trc, 0x0025);
+
+    SelectObject(hdc, old_font);
     1
 }
 

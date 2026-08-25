@@ -27,6 +27,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_Controls",
     # 系统时区：GetTimeZoneInformation / TIME_ZONE_INFORMATION
     "Win32_System_Time",
+    # 关于窗口链接悬停：ScreenToClient / TrackMouseEvent / TRACKMOUSEEVENT
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 winreg = "0.52"
 chrono = "0.4"
