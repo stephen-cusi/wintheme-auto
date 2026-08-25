@@ -40,7 +40,14 @@ jobs:
           arch: ${{ matrix.msvc_arch }}
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          # GitHub runner 的 Git\usr\bin 里有一个 POSIX link.exe（coreutils link 命令）。
+          # rustc 找链接器时可能解析到它而不是 MSVC 的 link.exe（arm64 交叉编译必踩），
+          # 表现为 "link: extra operand ..."。从 PATH 剔除强制走 VS 链接器。
+          # git 命令本身在 Git\cmd，不受影响。
+          $env:PATH = ($env:PATH.Split(';') | Where-Object { $_ -notlike '*\Git\usr\bin*' }) -join ';'
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         shell: pwsh
