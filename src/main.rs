@@ -30,7 +30,8 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SetBkColor, SetBkMode, SetTextColor,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect, SetBkColor, SetBkMode,
+    SetTextColor,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -38,12 +39,13 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW,
     DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW,
-    HMENU, IDC_ARROW, LoadCursorW, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE,
-    SW_SHOWNORMAL, TrackPopupMenu,
+    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, LoadCursorW, MessageBoxW,
+    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
 };
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_BUTTON};
 
 use crate::config::Config;
 use crate::sun::SunTimes;
@@ -349,6 +351,10 @@ unsafe extern "system" fn wnd_proc(
             FillRect(hdc, &rc, win_brush());
             1
         }
+        // 自绘按钮：深色背景 + 白字 + 状态反馈（hover/press/focus/disable）
+        0x002B => { // WM_DRAWITEM
+            draw_owner_button(lparam)
+        }
         // 后台定位完成后触发：立即重新评估并刷新托盘提示
         MSG_REFRESH => {
             if let Some(s) = APP_STATE.get() {
@@ -479,6 +485,16 @@ const BG_DARK: u32 = 0x001F1F1F; // 深色窗口背景
 const TEXT_DARK: u32 = 0x00E8E8E8; // 深色正文
 const EDIT_DARK: u32 = 0x002D2D2D; // 深色输入框（略亮于背景，便于辨认）
 
+// 自绘按钮颜色（深色主题下"凸"于 #1F1F1F 背景；浅色主题下深度更深的灰，比 #F2F2F2 深）
+const BTN_NORMAL_LIGHT: u32 = 0x00E1E1E1; // 浅色按钮常态
+const BTN_HOVER_LIGHT: u32 = 0x00D4D4D4; // 浅色按钮悬停
+const BTN_PRESSED_LIGHT: u32 = 0x00C0C0C0; // 浅色按钮按下
+const BTN_NORMAL_DARK: u32 = 0x002D2D2D; // 深色按钮常态
+const BTN_HOVER_DARK: u32 = 0x003F3F3F; // 深色按钮悬停
+const BTN_PRESSED_DARK: u32 = 0x001A1A1A; // 深色按钮按下
+const BTN_TEXT_DISABLED: u32 = 0x00808080; // 禁用文字
+const BTN_BORDER: u32 = 0x00808080; // 焦点边框
+
 /// 当前是否为深色主题（跟应用切换的主题一致）。
 fn is_dark() -> bool {
     theme::get_theme().map(|t| t == Theme::Dark).unwrap_or(false)
@@ -497,26 +513,118 @@ fn edit_text_color() -> u32 {
     if is_dark() { TEXT_DARK } else { TEXT_LIGHT }
 }
 
-/// 按主题缓存的窗口画刷。
+/// 按主题缓存的窗口画刷（主题切换时由 invalidate_theme_brushes 释放并重建）。
 fn win_brush() -> isize {
-    static L: OnceLock<isize> = OnceLock::new();
-    static D: OnceLock<isize> = OnceLock::new();
-    if is_dark() {
-        *D.get_or_init(|| unsafe { CreateSolidBrush(BG_DARK) })
-    } else {
-        *L.get_or_init(|| unsafe { CreateSolidBrush(BG_LIGHT) })
-    }
+    ensure_brush(&BG_BRUSH, bg_color())
 }
 
 /// 按主题缓存的输入框画刷。
 fn edit_brush() -> isize {
-    static L: OnceLock<isize> = OnceLock::new();
-    static D: OnceLock<isize> = OnceLock::new();
-    if is_dark() {
-        *D.get_or_init(|| unsafe { CreateSolidBrush(EDIT_DARK) })
-    } else {
-        *L.get_or_init(|| unsafe { CreateSolidBrush(EDIT_LIGHT) })
+    ensure_brush(&EDIT_BRUSH, edit_color())
+}
+
+// 用 Mutex<Option<isize>> 替代 OnceLock，让主题切换时能清空缓存并 DeleteObject 旧句柄。
+static BG_BRUSH: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+static EDIT_BRUSH: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+fn ensure_brush(slot: &'static std::sync::Mutex<Option<isize>>, color: u32) -> isize {
+    let mut g = slot.lock().unwrap();
+    if let Some(h) = *g {
+        if h != 0 {
+            return h;
+        }
     }
+    let h = unsafe { CreateSolidBrush(color) };
+    *g = Some(h);
+    h
+}
+
+/// 主题切换时调用：删除旧 brush 让下一次 WM_CTLCOLOR* 重建，避免深浅色穿越。
+unsafe fn invalidate_theme_brushes() {
+    if let Ok(mut g) = BG_BRUSH.lock() {
+        if let Some(h) = *g {
+            if h != 0 {
+                DeleteObject(h);
+            }
+        }
+        *g = None;
+    }
+    if let Ok(mut g) = EDIT_BRUSH.lock() {
+        if let Some(h) = *g {
+            if h != 0 {
+                DeleteObject(h);
+            }
+        }
+        *g = None;
+    }
+}
+
+/// 自绘按钮绘制（处理 WM_DRAWITEM）。
+/// 形参是 WM_DRAWITEM 的 lParam，返回 nonzero = 已处理该消息。
+unsafe fn draw_owner_button(lparam: LPARAM) -> LRESULT {
+    if lparam == 0 {
+        return 0;
+    }
+    let dis: &DRAWITEMSTRUCT = &*(lparam as *const DRAWITEMSTRUCT);
+    // 我们只为按钮绘制；菜单/组合框等保持默认
+    if dis.CtlType != ODT_BUTTON {
+        return 0;
+    }
+    let hdc = dis.hDC;
+    let mut rc = dis.rcItem;
+    let state = dis.itemState;
+
+    // 选颜色（按当前主题 + 状态）
+    let (bg, _) = if (state & ODS_DISABLED) != 0 {
+        (
+            if is_dark() { BTN_NORMAL_DARK } else { BTN_NORMAL_LIGHT },
+            true,
+        )
+    } else if (state & ODS_SELECTED) != 0 {
+        (
+            if is_dark() { BTN_PRESSED_DARK } else { BTN_PRESSED_LIGHT },
+            false,
+        )
+    } else if (state & ODS_HOTLIGHT) != 0 {
+        (
+            if is_dark() { BTN_HOVER_DARK } else { BTN_HOVER_LIGHT },
+            false,
+        )
+    } else {
+        (
+            if is_dark() { BTN_NORMAL_DARK } else { BTN_NORMAL_LIGHT },
+            false,
+        )
+    };
+    let brush = CreateSolidBrush(bg);
+    FillRect(hdc, &rc, brush);
+    // 删除临时刷子；FillRect 用完即可
+    DeleteObject(brush);
+
+    // 画按钮文字（居中）
+    let len = GetWindowTextLengthW(dis.hwndItem);
+    if len > 0 {
+        let mut buf: Vec<u16> = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(dis.hwndItem, buf.as_mut_ptr(), buf.len() as i32);
+        SetBkMode(hdc, 1); // TRANSPARENT
+        let text_color = if (state & ODS_DISABLED) != 0 {
+            BTN_TEXT_DISABLED
+        } else {
+            text_color()
+        };
+        SetTextColor(hdc, text_color);
+        // DT_CENTER | DT_VCENTER | DT_SINGLELINE = 0x0025
+        DrawTextW(hdc, buf.as_ptr(), n, &mut rc as *mut RECT, 0x0025);
+    }
+
+    // 焦点边框（无障碍要求）
+    if (state & ODS_FOCUS) != 0 && (state & ODS_NOFOCUSRECT) == 0 {
+        use windows_sys::Win32::Graphics::Gdi::DrawFocusRect;
+        SetTextColor(hdc, BTN_BORDER);
+        DrawFocusRect(hdc, &rc);
+    }
+
+    1
 }
 
 /// 给主窗口设置自定义标题栏 / 任务栏图标（大小随 DPI 缩放，避免高分屏下模糊）。
@@ -611,8 +719,10 @@ unsafe fn refresh_ui(hwnd: HWND) {
     update_tooltip(hwnd);
     if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
         apply_titlebar_theme(hwnd);
+        // 主题可能已切换：让旧的窗口/编辑刷子失效，下一次 WM_CTLCOLOR* 重建为当前主题颜色
+        invalidate_theme_brushes();
         gui::refresh_main_window(hwnd);
-        // 主题可能已切换：连同子控件一起重绘，让深浅色即时生效
+        // 连同子控件一起重绘，让深浅色即时生效（自绘按钮重发 WM_DRAWITEM）
         invalidate_with_children(hwnd);
     }
 }

@@ -23,6 +23,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_HiDpi",
     # 深色标题栏：DwmSetWindowAttribute
     "Win32_Graphics_Dwm",
+    # 自绘按钮：DRAWITEMSTRUCT / ODS_*
+    "Win32_UI_Controls",
 ] }
 winreg = "0.52"
 chrono = "0.4"

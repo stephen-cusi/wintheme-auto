@@ -50,8 +50,8 @@ pub const ID_BTN_SAVE_TIME: u32 = 4003;
 pub const ID_CHK_AUTOSTART: u32 = 5001;
 
 // 基础布局尺寸（按 96 DPI 设计，运行时按 DPI 缩放）
-pub const BASE_W: i32 = 460;
-pub const BASE_H: i32 = 420;
+pub const BASE_W: i32 = 480;
+pub const BASE_H: i32 = 460;
 
 // 常用 raw u32 window style（避免与 windows-sys 的 NewType 混用）
 mod raw {
@@ -68,6 +68,8 @@ mod raw {
     pub const WS_EX_CLIENTEDGE: u32 = 0x00000200;
     pub const STM_SETICON: u32 = 0x0170;
     pub const GWLP_USERDATA: i32 = -21;
+    // 自绘按钮类型（替代 BS_PUSHBUTTON，按钮走 WM_DRAWITEM 自绘深色风格）
+    pub const BS_OWNERDRAW: u32 = 0x000B;
 }
 
 fn w(s: &str) -> Vec<u16> {
@@ -144,12 +146,16 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
     let k = dpi_scale_for_window(parent);
     // 按 DPI 缩放坐标的辅助闭包
     let s = |v: i32| -> i32 { ((v as f64) * k).round() as i32 };
-    let mx = s(26);
-    let content_w = s(BASE_W - 2 * 26);
 
-    // 大字号粗体字体（"当前主题"标签用），高度随 DPI 缩放
-    let big_font: HFONT = CreateFontW(
-        s(28),
+    // 页面内边距（统一左右）
+    let mx = s(28);
+    let content_w = s(BASE_W - 2 * 28);
+    let gap_x = s(12); // 列间距
+    let col_w = (content_w - gap_x) / 2;
+
+    // 大字号粗体字体（"当前主题"标题用），高度随 DPI 缩放
+    let title_font: HFONT = CreateFontW(
+        s(30),
         0,
         0,
         0,
@@ -165,12 +171,22 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         w("Microsoft YaHei UI").as_ptr(),
     );
 
-    // ---- 头部：大图标 + 当前主题大字 ----
+    // ---- 顶部留白 + 头部：大图标 + 当前主题大字 ----
     make_static(parent, hinst, ID_LBL_ICON, SS_ICON, mx, s(20), s(52), s(52), "");
-    make_static(parent, hinst, ID_LBL_THEME, SS_LEFT, s(92), s(24), content_w - s(92 - 26), s(42), "");
+    make_static(
+        parent,
+        hinst,
+        ID_LBL_THEME,
+        SS_LEFT,
+        mx + s(70),
+        s(22),
+        content_w - s(70),
+        s(48),
+        "",
+    );
 
-    // ---- 状态信息行 ----
-    let mut y = s(92);
+    // ---- 状态信息行（紧凑三行）----
+    let mut y = s(96);
     make_static(parent, hinst, ID_LBL_MODE, SS_LEFT, mx, y, content_w, s(20), "");
     y += s(22);
     make_static(parent, hinst, ID_LBL_POS, SS_LEFT, mx, y, content_w, s(20), "");
@@ -185,46 +201,78 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         .map(|st| st.cfg.auto_start)
         .unwrap_or(true);
     make_checkbox(parent, hinst, ID_CHK_AUTOSTART, mx, y, s(220), s(24), "开机自动启动", auto_start);
-    y += s(26);
+    y += s(30);
 
-    // ---- 定时模式：时间编辑区 ----
-    let row_h = s(24);
-    const SS_CENTERIMAGE: u32 = 0x0200; // 文字垂直居中，便于与输入框对齐
-    make_static(parent, hinst, 0, SS_LEFT | SS_CENTERIMAGE, mx, y, s(86), row_h, "浅色时刻:");
-    make_edit(parent, hinst, ID_EDIT_LIGHT, mx + s(88), y, s(64), row_h);
-    make_static(parent, hinst, 0, SS_LEFT | SS_CENTERIMAGE, mx + s(168), y, s(86), row_h, "深色时刻:");
-    make_edit(parent, hinst, ID_EDIT_DARK, mx + s(254), y, s(64), row_h);
-    make_button(parent, hinst, ID_BTN_SAVE_TIME, mx + s(344), y, s(68), row_h, "保存");
-    y += s(34);
+    // ---- 定时模式：时间编辑区（紧凑单行，三个元素横排）----
+    let row_h = s(26);
+    const SS_CENTERIMAGE: u32 = 0x0200;
+    let label_w = s(78);
+    let edit_w = s(72);
+    let save_w = s(76);
+    let label_dark_w = s(78);
+
+    let lx1 = mx;
+    make_static(
+        parent,
+        hinst,
+        0,
+        SS_LEFT | SS_CENTERIMAGE,
+        lx1,
+        y,
+        label_w,
+        row_h,
+        "浅色时刻:",
+    );
+    let ex1 = lx1 + label_w + s(8);
+    make_edit(parent, hinst, ID_EDIT_LIGHT, ex1, y, edit_w, row_h);
+
+    let lx2 = ex1 + edit_w + s(16);
+    make_static(
+        parent,
+        hinst,
+        0,
+        SS_LEFT | SS_CENTERIMAGE,
+        lx2,
+        y,
+        label_dark_w,
+        row_h,
+        "深色时刻:",
+    );
+    let ex2 = lx2 + label_dark_w + s(8);
+    make_edit(parent, hinst, ID_EDIT_DARK, ex2, y, edit_w, row_h);
+
+    let bx = ex2 + edit_w + s(16);
+    make_button(parent, hinst, ID_BTN_SAVE_TIME, bx, y, save_w, row_h, "保存");
+    y += s(36);
 
     // ---- 底部提示 ----
     make_static(parent, hinst, ID_LBL_HINT, SS_LEFT, mx, y, content_w, s(20), "");
-    y += s(28);
+    y += s(30);
 
-    // ---- 按钮（两列）----
-    let btn_w = s(186);
-    let btn_h = s(36);
-    let col2_x = mx + s(186) + s(18);
+    // ---- 按钮（两列，三行）----
+    let btn_h = s(40);
+    let btn_w = col_w;
+    let col2_x = mx + btn_w + gap_x;
     make_button(parent, hinst, ID_BTN_TOGGLE, mx, y, btn_w, btn_h, "立即切换主题");
     make_button(parent, hinst, ID_BTN_CHECK, col2_x, y, btn_w, btn_h, "立即检查");
-    y += s(46);
+    y += btn_h + s(10);
     make_button(parent, hinst, ID_BTN_CYCLE_MODE, mx, y, btn_w, btn_h, "切换模式");
     make_button(parent, hinst, ID_BTN_OPEN_CFG, col2_x, y, btn_w, btn_h, "打开配置文件");
-    y += s(46);
+    y += btn_h + s(10);
     make_button(parent, hinst, ID_BTN_HIDE, mx, y, btn_w, btn_h, "隐藏到托盘");
     make_button(parent, hinst, ID_BTN_EXIT, col2_x, y, btn_w, btn_h, "退出程序");
 
     // 给大字体标签设字体
     let theme_lbl = GetDlgItem(parent, ID_LBL_THEME as i32);
-    if theme_lbl != 0 && big_font != 0 {
+    if theme_lbl != 0 && title_font != 0 {
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
         use windows_sys::Win32::Foundation::WPARAM;
-        SendMessageW(theme_lbl, WM_SETFONT, big_font as WPARAM, 1);
+        SendMessageW(theme_lbl, WM_SETFONT, title_font as WPARAM, 1);
     }
-    // 把 big_font 句柄存到窗口 GWLP_USERDATA，窗口销毁时 DeleteObject（避免字体泄露）
-    if big_font != 0 {
+    // 把 title_font 句柄存到窗口 GWLP_USERDATA，窗口销毁时 DeleteObject
+    if title_font != 0 {
         use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
-        SetWindowLongPtrW(parent, raw::GWLP_USERDATA, big_font as isize);
+        SetWindowLongPtrW(parent, raw::GWLP_USERDATA, title_font as isize);
     }
 }
 
@@ -270,7 +318,9 @@ unsafe fn make_button(
     text: &str,
 ) -> HWND {
     let t = w(text);
-    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | BS_PUSHBUTTON as u32;
+    // 自绘深色按钮：用 BS_OWNERDRAW 替代 BS_PUSHBUTTON，
+    // 由主窗口 wnd_proc 的 WM_DRAWITEM 处理绘制（深色圆角矩形 + 白字 + 状态反馈）。
+    let s = raw::WS_CHILD | raw::WS_VISIBLE | raw::WS_TABSTOP | raw::BS_OWNERDRAW;
     let h = CreateWindowExW(
         0,
         w("BUTTON").as_ptr(),

@@ -9,3 +9,6 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# 临时 / 一次性脚本（避免误提交）
+scripts/inspect_api.py
