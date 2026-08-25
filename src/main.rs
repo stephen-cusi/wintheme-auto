@@ -35,11 +35,11 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW,
-    DestroyMenu, DestroyWindow, EnableWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW,
+    DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW,
     GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, InsertMenuItemW, LoadCursorW,
     MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MFT_SEPARATOR,
     MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MF_SEPARATOR, MF_STRING, MessageBoxW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
     SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_QUIT, WM_SETFONT, WM_TIMER, WNDCLASSW, HWND_MESSAGE,
@@ -858,7 +858,8 @@ unsafe fn show_about_dialog(parent: HWND) {
 
     // 模态对话框：禁用父窗口，只为 about 窗口跑局部消息循环。
     // 用 GetMessageW(hwnd) 过滤，窗口销毁后自然返回 0 退出循环。
-    EnableWindow(parent, 0);
+    // 用 SendMessage(WM_ENABLE) 替代 EnableWindow（后者在 windows-sys 0.52 模块位置不同）。
+    SendMessageW(parent, 0x000A /* WM_ENABLE */, 0, 0);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
     let mut msg: MSG = std::mem::zeroed();
@@ -866,7 +867,7 @@ unsafe fn show_about_dialog(parent: HWND) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    EnableWindow(parent, 1);
+    SendMessageW(parent, 0x000A /* WM_ENABLE */, 1, 0);
     SetForegroundWindow(parent);
     let _ = DestroyWindow(hwnd);
 }
@@ -1261,7 +1262,7 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
     }
     let item = &items[idx];
     let hdc = dis.hDC;
-    let mut rc = dis.rcItem;
+    let rc = dis.rcItem;
     let state = dis.itemState;
     let selected = (state & ODS_SELECTED) != 0;
     let grayed   = (state & ODS_DISABLED) != 0;
