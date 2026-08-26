@@ -88,6 +88,9 @@ struct AppState {
     location_status: Option<String>,
     /// 托盘窗口句柄，用于后台线程发消息通知刷新
     tray_hwnd: Option<HWND>,
+    /// 手动覆盖：用户在 sun/schedule 自动模式下手动切过主题时，记录"自动化当时想要的主题"。
+    /// 只要自动化想要的主题未变，就尊重手动选择、不强制切回；到下一个自动切换边界再恢复。
+    manual_desired: Option<Theme>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,6 +159,7 @@ fn main() -> anyhow::Result<()> {
         tz_offset_hours,
         location_status: None,
         tray_hwnd: None,
+        manual_desired: None,
     };
     APP_STATE
         .set(Arc::new(Mutex::new(state)))
@@ -1607,18 +1611,28 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
     1
 }
 
+/// 手动改主题时调用：记录"自动化当前想要的主题"作为手动覆盖参照，
+/// 使 tick() 只在到达下一个自动切换边界时才恢复自动(避免手动切换被下一轮定时覆盖)。
+fn mark_manual_override(s: &mut AppState) {
+    let cur = theme::get_theme().unwrap_or(Theme::Light);
+    let auto_desired = evaluate(s).unwrap_or(cur);
+    s.manual_desired = Some(auto_desired);
+}
+
 unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
-    let mut s = APP_STATE.get().unwrap().lock().unwrap();
-    match id {
+    let mut s = APP_STATE.get().unwrap().lock().unwrap();    match id {
         ID_LIGHT => {
+            mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Light);
             log("手动切换到浅色");
         }
         ID_DARK => {
+            mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Dark);
             log("手动切换到深色");
         }
         ID_TOGGLE => {
+            mark_manual_override(&mut *s);
             if let Ok(cur) = theme::get_theme() {
                 let _ = theme::set_theme(if cur == Theme::Light {
                     Theme::Dark
@@ -1629,16 +1643,19 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
         }
         ID_MODE_SUN => {
             s.cfg.mode = "sun".into();
+            s.manual_desired = None; // 切换模式即清除手动覆盖，交给新模式管理
             let _ = config::save(&s.cfg);
             log("模式 -> 跟随日出日落");
         }
         ID_MODE_SCHED => {
             s.cfg.mode = "schedule".into();
+            s.manual_desired = None;
             let _ = config::save(&s.cfg);
             log("模式 -> 定时切换");
         }
         ID_OFF => {
             s.cfg.mode = "off".into();
+            s.manual_desired = None;
             let _ = config::save(&s.cfg);
             log("模式 -> 暂停(手动)");
         }
@@ -1776,6 +1793,14 @@ fn tick(state: &mut AppState) -> anyhow::Result<()> {
         }
     }
     let desired = evaluate(state)?;
+    // 手动覆盖：用户在自动(sun/schedule)模式下手动改过主题，只要自动化想要的主题还没变，
+    // 就尊重手动选择、不强制切回；直到进入下一个自动切换边界再恢复正常自动。
+    if let Some(prev) = state.manual_desired {
+        if desired == prev {
+            return Ok(());
+        }
+        state.manual_desired = None; // 到达下一个切换边界：清除覆盖
+    }
     let current = theme::get_theme().unwrap_or(desired);
     if current != desired {
         theme::set_theme(desired)?;
