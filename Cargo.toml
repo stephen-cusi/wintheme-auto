@@ -1,6 +1,6 @@
 [package]
 name = "wintheme-auto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows 11 浅色/深色主题自动切换（跟随日出日落 或 定时），开机启动"
 license = "MIT"
