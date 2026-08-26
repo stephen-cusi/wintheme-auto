@@ -12,3 +12,6 @@ Thumbs.db
 
 # 临时 / 一次性脚本（避免误提交）
 scripts/inspect_api.py
+
+# 本仓库开发/维护注意事项（本地维护，不上传）
+AGENTS.md
