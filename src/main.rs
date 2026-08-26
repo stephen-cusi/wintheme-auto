@@ -448,7 +448,12 @@ unsafe extern "system" fn wnd_proc(
                     log("主窗口已隐藏到托盘");
                 }
                 gui::ID_BTN_EXIT => {
-                    PostQuitMessage(0);
+                    // 与托盘退出(ID_EXIT)保持一致：先隐藏让 DWM 重新合成底层桌面，
+                    // 再强制 DWM 完成合成，最后销毁窗口，避免退出时的白闪/残影。
+                    ShowWindow(hwnd, SW_HIDE);
+                    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+                    unsafe { DwmFlush() };
+                    DestroyWindow(hwnd);
                 }
                 gui::ID_BTN_CYCLE_MODE => {
                     // 循环切换模式：sun -> schedule -> off -> sun
