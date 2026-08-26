@@ -42,4 +42,6 @@ winres = "0.1"
 [profile.release]
 opt-level = "z"
 lto = true
+# 去掉 panic 解卷(Unwinding)机制：本程序无 catch_unwind/std::panic，不影响功能，可明显减小体积
+panic = "abort"
 strip = true
