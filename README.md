@@ -2,7 +2,7 @@
 
 [![build](https://github.com/stephen-cusi/wintheme-auto/actions/workflows/build.yml/badge.svg)](https://github.com/stephen-cusi/wintheme-auto/actions/workflows/build.yml)
 
-用 Rust 编写，纯 Win32 API，**零额外运行时依赖**。跟随日出日落或定时切换 Windows 11 浅色/深色主题，
+用 Rust 编写，纯 Win32 API，**零额外运行时依赖**。在 Windows 10/11 上跟随日出日落或定时切换浅色/深色主题，
 支持系统托盘常驻、登录自启。界面会**跟随当前主题自动切换深浅色**（标题栏、背景、文字、输入框、勾选框、自绘按钮）。
 
 > 😮‍💨 本项目由 **vibe coding**（AI 辅助结对编程）驱动开发——Rust/Win32 细节密集、容易踩坑，
@@ -22,7 +22,7 @@
 
 ## 功能
 
-- **跟随日出日落**：通过 Windows 11 系统位置 API（`Windows.Devices.Geolocation`）获取经纬度，
+- **跟随日出日落**：通过 Windows 系统位置 API（`Windows.Devices.Geolocation`，WinRT）获取经纬度，
   按当地日出/日落自动切换浅色/深色；也可在配置里写死经纬度（完全离线可用）。
 - **定时切换**：在设定的两个时刻（如 07:00 浅色 / 19:00 深色）之间切换，支持跨午夜。
 - **暂停模式**：`off` 模式下不动主题，仅保留托盘手动控制。
@@ -48,7 +48,7 @@
 
 配置与日志位于 exe 同目录的 `wintheme-auto\` 文件夹：
 
-```
+```text
 D:\path\to\wintheme-auto\wintheme-auto\config.toml
 D:\path\to\wintheme-auto\wintheme-auto\wintheme-auto.log
 ```
@@ -73,17 +73,30 @@ tray = true             # 是否显示托盘图标
 > 若系统位置开关已关闭或设备无传感器，会在界面提示并给出「打开系统位置设置」按钮，
 > **不会卡住程序**；也可以直接填死经纬度完全离线可用。
 
-## 构建（Windows 11）
+## 构建
 
-```powershell
-cargo build --release
-```
+依赖一套 MSVC 工具链即可（x64 和 ARM64 皆可，Windows 10 / 11 均可构建）：
 
-产物：`target\release\wintheme-auto.exe`。支持原生或 x64/ARM64 目标，直接双击运行即可。
+1. **安装 Rust**（选择 `msvc` 工具链，默认 `x86_64-pc-windows-msvc`）：
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+2. **安装 Visual Studio 2022 生成工具**（Build Tools），「工作负载」勾选 **使用 C++ 的桌面开发**，
+   它包含 `link.exe` 和 Windows SDK（SDK 里的 `rc.exe` 供 `build.rs` 嵌入 manifest/图标）。
+   - 仅编译 x64 → 勾选 **MSVC v143 - VS 2022 C++ x64/x86 生成工具** 即可。
+   - 想编译 **ARM64 原生版** → 额外勾选 **MSVC v143 - VS 2022 C++ ARM64 生成工具**，
+     并把目标设为 `aarch64-pc-windows-msvc`（不装也能编译 x64 版，靠系统模拟运行）。
+3. 编译：
+   ```powershell
+   cargo build --release
+   ```
+   产物：`target\release\wintheme-auto.exe`，双击即可运行。
 
-> **关于构建脚本**：`build.rs` 会用 SDK 里的 `rc.exe` 把 `app.manifest`（PerMonitorV2 高 DPI、
-> ComCtl32 v6 视觉样式）和图标嵌入 exe。若系统找不到 `rc.exe`（未装 Windows SDK），会
-> 优雅降级：仍能编译运行，只是失去视觉样式/图标。
+> **常见报错排查**：
+> - `linker 'link.exe' not found` → 第 2 步「使用 C++ 的桌面开发」没装或不完整。
+> - 找不到 `rc.exe`（未装 Windows SDK）→ `build.rs` 会优雅降级：仍能编译运行，只是失去视觉样式/图标；
+>   装上 SDK 后即可嵌入 `app.manifest`（PerMonitorV2 高 DPI、ComCtl32 v6）与图标。
+> - 无需任何运行时依赖：产物是单个 exe，拷到别的机器即可运行。
 
 ## 原理
 
