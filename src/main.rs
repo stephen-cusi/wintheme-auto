@@ -1163,7 +1163,7 @@ unsafe fn paint_about(hwnd: HWND) {
         "作者：stephen-cusi".to_string(),
         "仓库：github.com/stephen-cusi/wintheme-auto".to_string(),
         "协议：MIT License".to_string(),
-        "架构：".to_string() + arch_label(),
+        format!("架构：{} · 构建 {}", arch_label(), build_commit()),
         "".to_string(),
         "原生 Win32 + Rust 编写，零额外运行时依赖。".to_string(),
         "采用 vibe coding 方式开发。".to_string(),
@@ -1211,6 +1211,11 @@ fn arch_label() -> &'static str {
         "x86" => "x86",
         other => other,
     }
+}
+
+/// 构建时的 git 提交短 SHA（build.rs 注入 GIT_SHA；未注入回退 "dev"）。
+fn build_commit() -> &'static str {
+    option_env!("GIT_SHA").unwrap_or("dev")
 }
 
 /// 保存"仓库"链接行在关于窗口里的客户端矩形，供点击检测用。
