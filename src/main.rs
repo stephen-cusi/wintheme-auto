@@ -1765,6 +1765,16 @@ unsafe fn update_tooltip(hwnd: HWND) {
 // ---------------------------------------------------------------------------
 
 fn tick(state: &mut AppState) -> anyhow::Result<()> {
+    // 系统时区可能被用户改动（或开机时时钟错乱、后来才校正）。每轮 tick 重新读一次，
+    // 若偏移变了就作废日出日落缓存，让本轮 evaluate 用新时区重算，避免显示/主题停留在旧数据。
+    if let Ok(tz) = fetch_system_timezone() {
+        if state.tz_offset_hours != Some(tz) {
+            log(&format!("检测到系统时区变化 -> UTC offset {tz}，刷新日出日落缓存"));
+            state.tz_offset_hours = Some(tz);
+            state.sun_cache = None;
+            state.sun_cache_date = None;
+        }
+    }
     let desired = evaluate(state)?;
     let current = theme::get_theme().unwrap_or(desired);
     if current != desired {

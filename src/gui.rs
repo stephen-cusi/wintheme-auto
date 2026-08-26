@@ -693,7 +693,9 @@ fn next_action_sun(now: NaiveTime, st: &sun::SunTimes) -> String {
     };
     let delta_h = next_time - nh;
     if delta_h < 0.0 {
-        format!("下一动作：切换（今日 {} 已过）", fmt_hm(next_time))
+        // 今天的该时刻已过：下一次切换其实是明天同一时刻。
+        // 日出日落逐日几乎不变，直接沿用今天的值显示"明天"即可。
+        format!("下一次切到浅色：明天 {}", fmt_hm(next_time))
     } else {
         let h = delta_h as u32;
         let m = (((delta_h - h as f64) * 60.0) as u32) % 60;
