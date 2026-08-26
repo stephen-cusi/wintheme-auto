@@ -957,7 +957,7 @@ unsafe fn show_about_dialog(parent: HWND) {
     // 按 DPI 缩放窗口尺寸，避免高分屏下文字溢出
     let scale = gui::dpi_scale_for_window(parent);
     let ww: i32 = (450.0 * scale).round() as i32;
-    let wh: i32 = (520.0 * scale).round() as i32;
+    let wh: i32 = (540.0 * scale).round() as i32;
     let x = pp.x + (parent_rc.right - parent_rc.left - ww) / 2;
     let y = pp.y + (parent_rc.bottom - parent_rc.top - wh) / 2;
     let hwnd = CreateWindowExW(
@@ -1163,6 +1163,7 @@ unsafe fn paint_about(hwnd: HWND) {
         "作者：stephen-cusi".to_string(),
         "仓库：github.com/stephen-cusi/wintheme-auto".to_string(),
         "协议：MIT License".to_string(),
+        "架构：".to_string() + arch_label(),
         "".to_string(),
         "原生 Win32 + Rust 编写，零额外运行时依赖。".to_string(),
         "采用 vibe coding 方式开发。".to_string(),
@@ -1200,6 +1201,16 @@ unsafe fn paint_about(hwnd: HWND) {
     }
     SelectObject(hdc, old_font);
     let _ = EndPaint(hwnd, &mut ps);
+}
+
+/// 当前二进制编译时的 CPU 架构标识（x64 / ARM64 / x86 / …）。
+fn arch_label() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "ARM64",
+        "x86" => "x86",
+        other => other,
+    }
 }
 
 /// 保存"仓库"链接行在关于窗口里的客户端矩形，供点击检测用。
