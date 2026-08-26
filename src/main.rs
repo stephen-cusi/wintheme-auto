@@ -31,7 +31,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     SetTextColor, SelectObject,
 };
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     // 声明 PerMonitorV2 DPI 感知：高分屏(如 200%)下保持清晰，避免系统位图拉伸导致模糊。
     // 必须在创建任何窗口之前调用。
     unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        enable_per_monitor_v2();
         enable_dark_mode();
         flush_menu_themes();
     }
@@ -765,19 +765,38 @@ unsafe fn apply_app_icon(hwnd: HWND) {
 }
 
 /// 让标题栏跟随当前主题(深色标题栏 / 浅色标题栏)。
+/// 兼容性：值 20 仅 Win11 22000+；Win10 1809+ 用的是早期未公开的同一属性 = 19。
+/// 先试 20，失败再回退 19，避免 Win10 上标题栏不变深色。
 unsafe fn apply_titlebar_theme(hwnd: HWND) {
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const DWMWA_USE_IMMERSIVE_DARK_MODE_11: u32 = 20; // Win11
+    const DWMWA_USE_IMMERSIVE_DARK_MODE_10: u32 = 19; // Win10 1809+，未公开
     let dark: i32 = if is_dark() { 1 } else { 0 };
-    DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark as *const i32 as *const std::ffi::c_void,
-        std::mem::size_of::<i32>() as u32,
-    );
+    let attr = &dark as *const i32 as *const std::ffi::c_void;
+    let sz = std::mem::size_of::<i32>() as u32;
+    let hr = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_11, attr, sz);
+    if hr != 0 {
+        // Win10：用旧值 19 再试一次
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_10, attr, sz);
+    }
 }
 
 // ---- 让系统通用控件跟随深色模式(未公开 API，失败则静默保持现状)----
+
+/// PerMonitorV2 DPI 感知。Win10 1703+ 的 user32 才有 SetProcessDpiAwarenessContext，
+/// 直接 import 会让旧版 Win10 因"找不到入口点"而**加载失败**。这里动态获取，缺失则交给 manifest 兜底。
+unsafe fn enable_per_monitor_v2() {
+    type FnSetProcessDpiAwarenessContext = unsafe extern "system" fn(isize) -> i32;
+    let dll = LoadLibraryW(widestring("user32.dll").as_ptr());
+    if dll == 0 {
+        return;
+    }
+    let proc = GetProcAddress(dll, b"SetProcessDpiAwarenessContext\0".as_ptr() as PCSTR);
+    if let Some(base) = proc {
+        let f: FnSetProcessDpiAwarenessContext = std::mem::transmute(base);
+        let _ = f(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
 
 /// 进程启动时调用一次：告诉系统该应用“允许深色模式”(通用控件/菜单才会跟随主题)。
 unsafe fn enable_dark_mode() {

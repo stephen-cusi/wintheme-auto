@@ -8,6 +8,18 @@
 > 😮‍💨 本项目由 **vibe coding**（AI 辅助结对编程）驱动开发——Rust/Win32 细节密集、容易踩坑，
 > 全部代码在对话式迭代中写出、编译、调优而成。详见文末 **Vibe Coding** 一栏。
 
+## 系统要求 / 兼容性
+
+- **Windows 11**（推荐，Build 22000+）：标题栏深色用官方 `DWMWA_USE_IMMERSIVE_DARK_MODE=20`，全部特性完整可用。
+- **Windows 10 1809–22H2**：可用。标题栏深色用同属性的旧值 `=19`（Win10 上 `20` 无效，代码已做 `20→19` 回退）；
+  系统深色模式、定时/日出日落、托盘、开机自启、PerMonitorV2 高 DPI、系统位置 API（WinRT，Win10 1607+）都支持。
+- **Windows 10 1703–1803**：可运行（PerMonitorV2 DPI 可用），但系统深色模式尚不完整，标题栏/主题切换效果打折。
+- **Windows 10 < 1703**：不建议。`SetProcessDpiAwarenessContext` 用动态获取（缺失时交由 manifest 兜底），能启动，
+  但无 PerMonitorV2、无系统深色模式。
+
+> 定位依赖 **Windows 系统位置服务**（`Windows.Devices.Geolocation`，Win10 1607+），首次使用需在系统设置里
+> 允许「位置」访问并打开定位；也可在配置里写死经纬度完全离线。
+
 ## 功能
 
 - **跟随日出日落**：通过 Windows 11 系统位置 API（`Windows.Devices.Geolocation`）获取经纬度，

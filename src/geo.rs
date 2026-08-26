@@ -15,23 +15,23 @@ use std::time::Duration;
 /// - PowerShell 未安装 / 不在 PATH → spawn 失败
 /// - 整个流程超过 30 秒 → 主进程强杀子进程
 pub fn fetch_location() -> Result<(f64, f64)> {
-    log("正在获取位置：使用 win11 WinRT 位置 API…");
+    log("正在获取位置：使用 Windows 位置 API…");
     let coords = fetch_location_system()?;
     log(&format!(
-        "位置获取成功（win11 WinRT 位置 API）：{:.4}, {:.4}",
+        "位置获取成功（Windows 位置 API）：{:.4}, {:.4}",
         coords.0, coords.1
     ));
     Ok(coords)
 }
 
 // ---------------------------------------------------------------------------
-// 路径 1（仅剩这一条）: Win11 WinRT 位置 API
+// 路径 1（仅剩这一条）: Windows 系统位置 API(WinRT，Win10 1607+)
 // ---------------------------------------------------------------------------
 
 /// 通过 PowerShell 子进程调用 WinRT `Windows.Devices.Geolocation.Geolocator.GetGeopositionAsync`。
 ///
-/// Win11 在首次调用时会弹出系统的"是否允许此应用访问位置位置"对话框。此后用户可以
-/// 在「设置 → 隐私和安全性 → 位置」中更改授权。
+/// 首次调用时会弹出系统的"是否允许此应用访问位置"对话框。此后用户可以
+/// 在「设置 → 隐私 → 位置」中更改授权。
 ///
 /// 失败原因（用于回退判定）：
 /// - 用户拒绝权限 → GetGeopositionAsync 抛 UnauthorizedAccessException
