@@ -79,7 +79,8 @@ jobs:
         with:
           tag_name: rolling
           name: WinTheme Auto (rolling)
-          update_release: true
+          # v3 已在 tag 存在时自动更新该 release；overwrite_files 确保替换同名产物
+          overwrite_files: true
           prerelease: true
           files: dist/*.exe
           body: |
