@@ -102,12 +102,12 @@ jobs:
 
             Binaries: x64 and ARM64 (attached `.exe` files).
 
-  # 版本化发布（按触发事件拆分，避免跨事件引用 inputs 导致 push 触发校验失败）：
-  # - 推送 tag(如 0.2beta)：只用 github.* 上下文
-  # - 手动 workflow_dispatch：只用 inputs.* 上下文
+  # 版本化发布：手动 workflow_dispatch 或 推送 tag(如 0.2beta) 时触发，
+  # 用 CI 构建的产物发布对应版本号的 Release。含 beta/rc 则标记为 prerelease。
+  # 手动触发不改动上面的 rolling。
   release_version:
-    name: Publish GitHub Release (tag)
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    name: Publish GitHub Release (${{ (github.event_name == 'push' && github.ref_name) || inputs.version }})
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -116,44 +116,27 @@ jobs:
           path: dist-tag
           merge-multiple: true
 
-      - name: Create / update tag GitHub Release
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "ver=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update version GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.ver.outputs.ver }}
+          name: ${{ steps.ver.outputs.ver }}
           # beta/rc 预览版；正式版本则作为正式版
-          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          prerelease: ${{ contains(steps.ver.outputs.ver, 'beta') || contains(steps.ver.outputs.ver, 'rc') }}
           overwrite_files: true
           files: dist-tag/*.exe
           body: |
-            Release `${{ github.ref_name }}` (built by ci build).
-
-            Commit: `${{ github.sha }}`
-
-            Binaries: x64 and ARM64 (attached `.exe` files).
-
-  release_manual:
-    name: Publish GitHub Release (manual)
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist-manual
-          merge-multiple: true
-
-      - name: Create / update manual GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
-          # beta/rc 预览版；正式版本则作为正式版
-          prerelease: ${{ contains(inputs.version, 'beta') || contains(inputs.version, 'rc') }}
-          overwrite_files: true
-          files: dist-manual/*.exe
-          body: |
-            Release `${{ inputs.version }}` (built by ci build).
+            Release `${{ steps.ver.outputs.ver }}` (built by ci build).
 
             Commit: `${{ github.sha }}`
 
