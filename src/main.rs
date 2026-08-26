@@ -39,7 +39,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, IDC_ARROW, InsertMenuItemW, LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
     MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
     MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
-    KillTimer, SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD,
+    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW,
     HWND_MESSAGE, IDC_HAND,
@@ -393,12 +393,6 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_TIMER => {
-            if _wparam as usize == TIMER_EXIT {
-                // 退出：窗口早已隐藏，到此销毁，避免半透明残影
-                KillTimer(hwnd, TIMER_EXIT);
-                DestroyWindow(hwnd);
-                return 0;
-            }
             if let Some(s) = APP_STATE.get() {
                 if let Ok(mut st) = s.lock() {
                     if let Err(e) = tick(&mut st) {
@@ -527,11 +521,6 @@ const GWLP_USERDATA: i32 = -21;
 
 /// 定时检查(主题/日出日落)的计时器 id
 const TIMER_MAIN: usize = 1;
-/// 退出时的延时销毁计时器 id：先 SW_HIDE 让 DWM 重新合成桌面，再延时 DestroyWindow，
-/// 避免"关闭时半透明残影"。
-const TIMER_EXIT: usize = 2;
-/// 退出前隐藏窗口到真正销毁的延时(ms)
-const EXIT_HIDE_DELAY_MS: u32 = 80;
 
 // 自绘复选框的勾选状态(自己维护，不依赖系统 BM_GETCHECK，避免 owner-draw 语义不一致)。
 // 启动时从 cfg 同步；点击时由 toggle_checkbox 翻转，同时写回 cfg(start_auto / start_minimized)。
@@ -1685,9 +1674,12 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
         }
         ID_EXIT => {
             drop(s);
-            // 先隐藏窗口，让 DWM 立刻重新合成底层桌面，再延时销毁，避免退出残影
+            // 干净退出：先隐藏窗口(让 DWM 重新合成底层桌面)，再强制 DWM 完成合成，最后销毁。
+            // 这样既不会让自定义子控件在销毁瞬间擦成白闪，也不会留下半透明残影。
             ShowWindow(hwnd, SW_HIDE);
-            SetTimer(hwnd, TIMER_EXIT, EXIT_HIDE_DELAY_MS, None);
+            use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+            unsafe { DwmFlush() };
+            DestroyWindow(hwnd);
             return;
         }
         _ => {}
