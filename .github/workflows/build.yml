@@ -18,10 +18,8 @@ jobs:
         include:
           - arch: x64
             target: x86_64-pc-windows-msvc
-            msvc_arch: x64
           - arch: arm64
             target: aarch64-pc-windows-msvc
-            msvc_arch: arm64
     steps:
       - uses: actions/checkout@v7
 
@@ -30,21 +28,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # 配置 MSVC 链接环境。x64 预装在 runner 上；arm64 生成工具在 windows-latest
-      # 镜像中已预装（GitHub 自 2024 年起提供），无需手动安装。
-      # 若 arm64 链接报缺 ARM64 库，可改用 cargo-xwin 交叉编译方案。
-      - name: Configure MSVC (${{ matrix.msvc_arch }})
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
-
       - name: Build release
         shell: pwsh
         run: |
+          # 设置 MSVC 编译环境。直接在 pwsh 里调 vcvarsall.bat（不用 node 动作，
+          # 避免 ilammy/msvc-dev-cmd 的 Node20 弃用警告）。
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vsWhere)) {
+            $vsWhere = "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+          }
+          $vsPath = & $vsWhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) { throw "未找到 Visual Studio 的 VC 工具" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          $vcArch = if ('${{ matrix.arch }}' -eq 'x64') { 'amd64' } else { 'arm64' }
+          # 捕获 vcvarsall 导出的环境变量，写进当前 PowerShell 进程，供下方 cargo 使用
+          cmd /c "call `"$vcvars`" $vcArch >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+          }
           # GitHub runner 的 Git\usr\bin 里有一个 POSIX link.exe（coreutils link 命令）。
           # rustc 找链接器时可能解析到它而不是 MSVC 的 link.exe（arm64 交叉编译必踩），
           # 表现为 "link: extra operand ..."。从 PATH 剔除强制走 VS 链接器。
-          # git 命令本身在 Git\cmd，不受影响。
           $env:PATH = ($env:PATH.Split(';') | Where-Object { $_ -notlike '*\Git\usr\bin*' }) -join ';'
           cargo build --release --target ${{ matrix.target }}
 
