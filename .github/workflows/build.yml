@@ -3,13 +3,7 @@ name: ci build
 on:
   push:
     branches: [main]
-    tags: ['*']
   workflow_dispatch:
-    inputs:
-      version:
-        description: '版本号（如 0.2beta），用于手动发布对应的 Release'
-        required: false
-        default: '0.2beta'
 
 permissions:
   contents: write # release job 需要创建/更新 Release / 上传产物
@@ -76,7 +70,7 @@ jobs:
   # 替换 x64/ARM64 产物并把当前 commit 写进说明。
   release:
     name: Publish GitHub Release (rolling)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -99,45 +93,5 @@ jobs:
 
             Commit: `${{ github.sha }}`
             ${{ github.event.head_commit.message }}
-
-            Binaries: x64 and ARM64 (attached `.exe` files).
-
-  # 版本化发布：手动 workflow_dispatch 或 推送 tag(如 0.2beta) 时触发，
-  # 用 CI 构建的产物发布对应版本号的 Release。含 beta/rc 则标记为 prerelease。
-  # 手动触发不改动上面的 rolling。
-  release_version:
-    name: Publish GitHub Release (${{ (github.event_name == 'push' && github.ref_name) || inputs.version }})
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch'
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist-tag
-          merge-multiple: true
-
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "ver=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ver=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create / update version GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.ver.outputs.ver }}
-          name: ${{ steps.ver.outputs.ver }}
-          # beta/rc 预览版；正式版本则作为正式版
-          prerelease: ${{ contains(steps.ver.outputs.ver, 'beta') || contains(steps.ver.outputs.ver, 'rc') }}
-          overwrite_files: true
-          files: dist-tag/*.exe
-          body: |
-            Release `${{ steps.ver.outputs.ver }}` (built by ci build).
-
-            Commit: `${{ github.sha }}`
 
             Binaries: x64 and ARM64 (attached `.exe` files).
