@@ -57,8 +57,8 @@ D:\path\to\wintheme-auto\wintheme-auto\wintheme-auto.log
 
 ```toml
 mode = "sun"            # sun=跟随日出日落 / schedule=定时 / off=暂停
-latitude = null         # 留空则自动按系统位置获取；也可填固定值，如 31.23
-longitude = null
+# latitude = 31.23      # 需要固定经纬度时，取消注释并填数值；留空(不写)则自动按系统位置获取
+# longitude = 114.17
 light_time = "07:00"    # schedule 模式：浅色时刻
 dark_time = "19:00"     # schedule 模式：深色时刻
 check_interval_secs = 60
@@ -66,6 +66,7 @@ auto_start = true       # 是否写开机启动注册表
 start_minimized = true  # 开机自启时静默进托盘，不弹主窗口
 tray = true             # 是否显示托盘图标
 ```
+> 注意：TOML 没有 `null` 值。想"自动按系统位置获取"，直接把 `latitude`/`longitude` 两行**省略**即可（程序会取默认值并自动定位），不要写成 `latitude = null`——那样会导致配置解析失败。
 
 修改配置后重启程序生效。
 
