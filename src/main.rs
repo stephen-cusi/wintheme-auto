@@ -36,9 +36,11 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CallWindowProcW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT,
     DefWindowProcW, DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos,
-    GetDlgItem, GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
-    InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
-    MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    GetDlgItem, GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowLongPtrW, IDC_ARROW,
+    InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW, MENUINFO, MENUITEMINFOW, MFS_CHECKED,
+    MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIM_APPLYTOSUBMENUS, MIM_BACKGROUND, MIIM_DATA,
+    MIIM_FTYPE, MIIM_ID, MIIM_STATE, SetMenuInfo,
     MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, SetWindowsHookExW, SW_HIDE,
     SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage,
@@ -1541,23 +1543,60 @@ unsafe extern "system" fn menu_dark_cbt_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const HCBT_CREATEWND: i32 = 3;
     const HCBT_ACTIVATE: i32 = 5;
-    if n_code == HCBT_ACTIVATE {
-        // 注意：HCBT_ACTIVATE 对本线程内任何窗口激活都会触发(比如菜单关闭后前台
-        // 窗口重新激活那次)。绝不能把主窗口也子类化掉——只认系统菜单窗口类 "#32768"。
+    if n_code == HCBT_CREATEWND || n_code == HCBT_ACTIVATE {
         let h = wparam as HWND;
-        let want: Vec<u16> = "#32768".encode_utf16().collect();
-        let mut cls = [0u16; 8];
-        let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
-        if n == want.len() as i32 && cls[..want.len()] == want[..] {
-            allow_dark_window(h, is_dark());
-            // 彻底去掉边框：子类化菜单窗口，吞掉 NC 边框绘制(含主题引擎的私有 NC 消息)。
-            // 阴影仍由 DWM 提供，观感与目标风格一致(无边框 + 投影)。
-            let prev = SetWindowLongPtrW(h, GWLP_WNDPROC, menu_nc_proc as isize);
-            MENU_ORIG_PROC.store(prev, Ordering::Relaxed);
+        // 注意：CBT 通知对本线程内任何窗口都会触发(比如菜单关闭后前台窗口重新激活)。
+        // 绝不能把主窗口也子类化掉——只认系统菜单窗口类 "#32768"。
+        if is_menu_window(h) {
+            // 关键保护：别把已经子类化的窗口再包一层(那会把自己当原过程，递归爆栈)
+            let cur = GetWindowLongPtrW(h, GWLP_WNDPROC);
+            if cur != menu_nc_proc as isize {
+                setup_menu_window(h);
+            }
         }
     }
     CallNextHookEx(0, n_code, wparam, lparam)
+}
+
+/// 判断 hwnd 是否为系统弹出菜单窗口(类名 "#32768")。
+unsafe fn is_menu_window(h: HWND) -> bool {
+    let want: Vec<u16> = "#32768".encode_utf16().collect();
+    let mut cls = [0u16; 8];
+    let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
+    n == want.len() as i32 && cls[..want.len()] == want[..]
+}
+
+/// 对菜单窗口应用深色 + 去边框 + 圆角。
+/// 在 HCBT_CREATEWND(刚创建、首帧绘制前)调用是关键——等 ACTIVATE 再做，
+/// 菜单可能已经用原过程画过一遍亮色背景/边框，留下 1px 细线。
+unsafe fn setup_menu_window(h: HWND) {
+    allow_dark_window(h, is_dark());
+    // 吞掉 NC 边框绘制(含主题引擎的私有 NC 消息)，客户区背景按主题刷
+    let prev = SetWindowLongPtrW(h, GWLP_WNDPROC, menu_nc_proc as isize);
+    MENU_ORIG_PROC.store(prev, Ordering::Relaxed);
+    // Win11 22H2+ 的 DWM 在合成时给窗口画 1px 边框(消息层拦不住)，用 DWM 属性去掉
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    let none_color: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE = 无边框
+    DwmSetWindowAttribute(
+        h,
+        34, // DWMWA_BORDER_COLOR
+        &none_color as *const u32 as *const core::ffi::c_void,
+        4,
+    );
+    // Win11：菜单窗口圆角(对齐 Defender 风格；旧系统调用失败，忽略)
+    let round: u32 = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(
+        h,
+        33, // DWMWA_WINDOW_CORNER_PREFERENCE
+        &round as *const u32 as *const core::ffi::c_void,
+        4,
+    );
+    log(&format!(
+        "托盘菜单弹出: 深色={}, 已应用去边框/圆角",
+        is_dark()
+    ));
 }
 
 const GWLP_WNDPROC: i32 = -4;
@@ -1645,6 +1684,16 @@ mii.fType = MFT_OWNERDRAW;
         }
     }
 
+    // 菜单窗口背景刷：条目矩形四周系统保留的 inset 空隙用这个刷子填。
+    // 不设置的话默认用系统"菜单背景色"(亮色=白)——这就是深色菜单四周发白的来源之一。
+    // 刷子在 DestroyMenu 之后才删除。
+    let menu_brush = CreateSolidBrush(bg_color());
+    let mut mi: MENUINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MENUINFO>() as u32;
+    mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+    mi.hbrBack = menu_brush;
+    SetMenuInfo(menu, &mi);
+
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
@@ -1660,6 +1709,7 @@ mii.fType = MFT_OWNERDRAW;
         UnhookWindowsHookEx(hook);
     }
     DestroyMenu(menu);
+    DeleteObject(menu_brush);
     // 清理快照，避免潜在的下一次访问读到过期数据
     MENU_ITEMS.lock().unwrap().clear();
 
