@@ -13,7 +13,7 @@ mod theme;
 use anyhow::anyhow;
 use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
@@ -34,15 +34,15 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu,
-    DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetDlgItem, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, InsertMenuItemW, IsWindowVisible, KillTimer,
-    LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
+    CallNextHookEx, CallWindowProcW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT,
+    DefWindowProcW, DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos,
+    GetDlgItem, GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
+    InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
     MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
-    MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
-    SetTimer, ShowWindow, SetWindowsHookExW, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, UnhookWindowsHookEx,
-    WM_CLOSE, WM_COMMAND, WM_CREATE,
+    MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, SetWindowsHookExW, SW_HIDE,
+    SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage,
+    DispatchMessageW, UnhookWindowsHookEx, WM_CLOSE, WM_COMMAND, WM_CREATE, WNDPROC,
     WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW,
     HWND_MESSAGE, IDC_HAND,
 };
@@ -1543,9 +1543,64 @@ unsafe extern "system" fn menu_dark_cbt_proc(
 ) -> LRESULT {
     const HCBT_ACTIVATE: i32 = 5;
     if n_code == HCBT_ACTIVATE {
-        allow_dark_window(wparam as HWND, is_dark());
+        // 注意：HCBT_ACTIVATE 对本线程内任何窗口激活都会触发(比如菜单关闭后前台
+        // 窗口重新激活那次)。绝不能把主窗口也子类化掉——只认系统菜单窗口类 "#32768"。
+        let h = wparam as HWND;
+        let want: Vec<u16> = "#32768".encode_utf16().collect();
+        let mut cls = [0u16; 8];
+        let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
+        if n == want.len() as i32 && cls[..want.len()] == want[..] {
+            allow_dark_window(h, is_dark());
+            // 彻底去掉边框：子类化菜单窗口，吞掉 NC 边框绘制(含主题引擎的私有 NC 消息)。
+            // 阴影仍由 DWM 提供，观感与目标风格一致(无边框 + 投影)。
+            let prev = SetWindowLongPtrW(h, GWLP_WNDPROC, menu_nc_proc as isize);
+            MENU_ORIG_PROC.store(prev, Ordering::Relaxed);
+        }
     }
     CallNextHookEx(0, n_code, wparam, lparam)
+}
+
+const GWLP_WNDPROC: i32 = -4;
+/// 被子类化的菜单窗口的原窗口过程(同一时间只有一个托盘菜单)。
+static MENU_ORIG_PROC: AtomicIsize = AtomicIsize::new(0);
+
+/// 菜单窗口的子类过程：
+/// - 不画 NC 边框(WM_NCPAINT 与主题引擎私有的 0xAE/0xAF)；
+/// - 客户区背景(条目矩形周围系统保留的 inset 空隙)自己按主题刷——菜单窗口默认
+///   用系统"菜单背景色"(亮色=白)填充，这就是深色菜单白边的真正来源；
+/// 其余消息全部转发给原过程。
+unsafe extern "system" fn menu_nc_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    const WM_NCPAINT: u32 = 0x0085;
+    const WM_NCUAHDRAWCAPTION: u32 = 0x00AE; // 主题引擎画 NC 标题(未公开)
+    const WM_NCUAHDRAWFRAME: u32 = 0x00AF; // 主题引擎画 NC 边框(未公开)
+    const WM_ERASEBKGND: u32 = 0x0014;
+    const WM_PRINTCLIENT: u32 = 0x03B8;
+    if msg == WM_NCPAINT || msg == WM_NCUAHDRAWCAPTION || msg == WM_NCUAHDRAWFRAME {
+        return 0; // 已处理 = 什么都不画
+    }
+    if msg == WM_ERASEBKGND || msg == WM_PRINTCLIENT {
+        let hdc = wparam as isize;
+        if hdc != 0 {
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let brush = CreateSolidBrush(bg_color());
+            FillRect(hdc, &rc, brush);
+            DeleteObject(brush);
+        }
+        return 1; // 背景已由我们刷成主题色
+    }
+    let orig = MENU_ORIG_PROC.load(Ordering::Relaxed);
+    if orig != 0 {
+        let proc: WNDPROC = std::mem::transmute(orig);
+        CallWindowProcW(proc, hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
 }
 
 unsafe fn show_menu(hwnd: HWND) {
