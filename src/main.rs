@@ -913,8 +913,14 @@ unsafe fn enable_per_monitor_v2() {
     }
 }
 
-/// 进程启动时调用一次：告诉系统该应用“允许深色模式”(通用控件/菜单才会跟随主题)。
+/// 进程启动时调用一次：告诉系统该应用"允许深色模式"(通用控件/菜单才会跟随主题)。
 unsafe fn enable_dark_mode() {
+    set_preferred_app_mode(1); // PreferredAppMode::AllowDark
+}
+
+/// uxtheme 非公开 API：SetPreferredAppMode。
+/// 0=Default 1=AllowDark(跟随系统) 2=ForceDark(强制深色) 3=ForceLight(强制浅色)
+unsafe fn set_preferred_app_mode(mode: u32) {
     type SetPreferredAppMode = unsafe extern "system" fn(u32) -> u32;
     let dll = LoadLibraryW(widestring("uxtheme.dll").as_ptr());
     if dll == 0 {
@@ -923,7 +929,7 @@ unsafe fn enable_dark_mode() {
     let proc = GetProcAddress(dll, b"SetPreferredAppMode\0".as_ptr() as PCSTR);
     if let Some(base) = proc {
         let f: SetPreferredAppMode = std::mem::transmute(base);
-        f(1); // PreferredAppMode::AllowDark
+        f(mode);
     }
 }
 
@@ -1697,6 +1703,12 @@ mii.fType = MFT_OWNERDRAW;
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
+    // 菜单窗口的原生 chrome(1px 边框、边距)按当前主题强制重取：
+    // AllowDark 模式下 uxtheme 可能持着进程启动时的旧主题缓存——系统后来切了深色，
+    // 菜单的 1px 原生边框仍按浅色画(自绘条目盖不住它，就是剩下那圈细线)。
+    // 弹出前 Force + Flush，结束后恢复 AllowDark 跟随系统。
+    set_preferred_app_mode(if is_dark() { 2 } else { 3 }); // ForceDark / ForceLight
+    flush_menu_themes();
     // 挂 CBT 钩子给即将弹出的菜单窗口上深色(消除深色菜单的白边框)
     const WH_CBT: i32 = 5;
     let hook = SetWindowsHookExW(WH_CBT, Some(menu_dark_cbt_proc), 0, GetCurrentThreadId());
@@ -1708,6 +1720,8 @@ mii.fType = MFT_OWNERDRAW;
     if hook != 0 {
         UnhookWindowsHookEx(hook);
     }
+    set_preferred_app_mode(1); // 恢复 AllowDark
+    flush_menu_themes();
     DestroyMenu(menu);
     DeleteObject(menu_brush);
     // 清理快照，避免潜在的下一次访问读到过期数据
