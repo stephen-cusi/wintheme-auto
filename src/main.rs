@@ -19,7 +19,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows_sys::core::PCSTR;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -34,14 +34,15 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
-    EnumChildWindows, GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW,
-    GetWindowTextW, IDC_ARROW, InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW,
-    MENUITEMINFOW, MFS_CHECKED,
+    CallNextHookEx, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu,
+    DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos, GetDlgItem, GetMessageW,
+    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, InsertMenuItemW, IsWindowVisible, KillTimer,
+    LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
     MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
     MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
-    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    SetTimer, ShowWindow, SetWindowsHookExW, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage, DispatchMessageW, UnhookWindowsHookEx,
+    WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW,
     HWND_MESSAGE, IDC_HAND,
 };
@@ -315,7 +316,7 @@ unsafe extern "system" fn wnd_proc(
             // 主窗口模式：在已创建的主窗口上填充 GUI 控件
             if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
                 let hinst = GetModuleHandleW(ptr::null());
-                allow_dark_window(hwnd);
+                allow_dark_window(hwnd, true);
                 gui::populate_main_window(hwnd, hinst);
                 // 设置标题栏 / 任务栏图标(用我们自定义的 .ico，而非默认图标)
                 apply_app_icon(hwnd);
@@ -924,8 +925,8 @@ unsafe fn enable_dark_mode() {
     }
 }
 
-/// 让指定窗口的深色模式生效(AllowDarkModeForWindow)。
-unsafe fn allow_dark_window(hwnd: HWND) {
+/// 让指定窗口的深色模式生效(AllowDarkModeForWindow)。`on` 跟随应用当前主题。
+unsafe fn allow_dark_window(hwnd: HWND, on: bool) {
     type AllowDark = unsafe extern "system" fn(isize, u32) -> u32;
     let dll = LoadLibraryW(widestring("uxtheme.dll").as_ptr());
     if dll == 0 {
@@ -934,7 +935,7 @@ unsafe fn allow_dark_window(hwnd: HWND) {
     let proc = GetProcAddress(dll, b"AllowDarkModeForWindow\0".as_ptr() as PCSTR);
     if let Some(base) = proc {
         let f: AllowDark = std::mem::transmute(base);
-        f(hwnd, 1);
+        f(hwnd, on as u32);
     }
 }
 
@@ -1531,6 +1532,22 @@ struct MenuItem {
 /// MENUITEMINFOW.dwItemData 存 index 进去(usize)，WM_DRAWITEM 时用 itemData 反查。
 static MENU_ITEMS: std::sync::Mutex<Vec<MenuItem>> = std::sync::Mutex::new(Vec::new());
 
+/// TrackPopupMenu 的菜单窗口是系统即时创建的，其非客户区边框默认跟随系统亮色主题
+/// ——这就是深色菜单外圈那圈白边的来源。WH_CBT 钩子在菜单窗口激活的瞬间拿到它的
+/// hwnd，对其应用 AllowDarkModeForWindow(跟随应用当前主题)，边框即随应用变深/变浅。
+/// 这是 win32 深色菜单的标准做法(uxtheme 非公开 API 缺失时静默降级为亮色边框)。
+unsafe extern "system" fn menu_dark_cbt_proc(
+    n_code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    const HCBT_ACTIVATE: i32 = 5;
+    if n_code == HCBT_ACTIVATE {
+        allow_dark_window(wparam as HWND, is_dark());
+    }
+    CallNextHookEx(0, n_code, wparam, lparam)
+}
+
 unsafe fn show_menu(hwnd: HWND) {
     let (mode, cur) = {
         let lock = APP_STATE.get().unwrap().lock().unwrap();
@@ -1576,11 +1593,17 @@ mii.fType = MFT_OWNERDRAW;
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
+    // 挂 CBT 钩子给即将弹出的菜单窗口上深色(消除深色菜单的白边框)
+    const WH_CBT: i32 = 5;
+    let hook = SetWindowsHookExW(WH_CBT, Some(menu_dark_cbt_proc), 0, GetCurrentThreadId());
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
         pt.x, pt.y, 0, hwnd, std::ptr::null(),
     );
+    if hook != 0 {
+        UnhookWindowsHookEx(hook);
+    }
     DestroyMenu(menu);
     // 清理快照，避免潜在的下一次访问读到过期数据
     MENU_ITEMS.lock().unwrap().clear();
