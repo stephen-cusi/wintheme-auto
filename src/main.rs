@@ -13,7 +13,7 @@ mod theme;
 use anyhow::anyhow;
 use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
@@ -28,15 +28,16 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FillRgn, GetDC,
     GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient, SetBkColor, SetBkMode,
-    SetTextColor, SelectObject,
+    SetTextColor, SelectObject, UpdateWindow,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
-    EnumChildWindows, GetClientRect, GetCursorPos, GetMessageW, GetWindowTextLengthW,
-    GetWindowTextW, IDC_ARROW, InsertMenuItemW, LoadCursorW, MENUITEMINFOW, MFS_CHECKED,
+    EnumChildWindows, GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW,
+    GetWindowTextW, IDC_ARROW, InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW,
+    MENUITEMINFOW, MFS_CHECKED,
     MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
     MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
     SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD,
@@ -392,6 +393,36 @@ unsafe extern "system" fn wnd_proc(
             refresh_ui(hwnd);
             0
         }
+        WM_TIMER if _wparam == TIMER_SUBMENU => {
+            // 子复选框展开/收起动画：每帧推进进度并只重绘该控件
+            let h = GetDlgItem(hwnd, gui::ID_CHK_START_MINIMIZED as i32);
+            if h == 0 {
+                KillTimer(hwnd, TIMER_SUBMENU);
+                SUB_ANIM_ACTIVE.store(false, Ordering::Relaxed);
+                return 0;
+            }
+            let showing = SUB_ANIM_SHOWING.load(Ordering::Relaxed);
+            let mut f = SUB_ANIM_FRAME.load(Ordering::Relaxed);
+            if showing && f < SUB_ANIM_FRAMES {
+                f += 1;
+                SUB_ANIM_FRAME.store(f, Ordering::Relaxed);
+            } else if !showing && f > 0 {
+                f -= 1;
+                SUB_ANIM_FRAME.store(f, Ordering::Relaxed);
+            }
+            InvalidateRect(h, ptr::null(), 1);
+            UpdateWindow(h);
+            // && 优先级高于 ||，无需括号
+            let done = showing && f == SUB_ANIM_FRAMES || !showing && f == 0;
+            if done {
+                KillTimer(hwnd, TIMER_SUBMENU);
+                SUB_ANIM_ACTIVE.store(false, Ordering::Relaxed);
+                if !showing {
+                    ShowWindow(h, SW_HIDE);
+                }
+            }
+            0
+        }
         WM_TIMER => {
             if let Some(s) = APP_STATE.get() {
                 if let Ok(mut st) = s.lock() {
@@ -526,6 +557,14 @@ const GWLP_USERDATA: i32 = -21;
 
 /// 定时检查(主题/日出日落)的计时器 id
 const TIMER_MAIN: usize = 1;
+/// 子复选框展开/收起动画的计时器 id
+const TIMER_SUBMENU: usize = 2;
+/// 子复选框动画总帧数(16ms/帧 ≈ 144ms)
+const SUB_ANIM_FRAMES: usize = 9;
+/// 子复选框动画状态：ACTIVE=动画进行中；SHOWING=方向(true=展开)；FRAME=当前帧(0..=SUB_ANIM_FRAMES)
+static SUB_ANIM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SUB_ANIM_SHOWING: AtomicBool = AtomicBool::new(true);
+static SUB_ANIM_FRAME: AtomicUsize = AtomicUsize::new(SUB_ANIM_FRAMES);
 
 // 自绘复选框的勾选状态(自己维护，不依赖系统 BM_GETCHECK，避免 owner-draw 语义不一致)。
 // 启动时从 cfg 同步；点击时由 toggle_checkbox 翻转，同时写回 cfg(start_auto / start_minimized)。
@@ -685,8 +724,20 @@ unsafe fn draw_owner_button(lparam: LPARAM) -> LRESULT {
     1
 }
 
+/// COLORREF(0x00BBGGRR) 各通道线性插值：t=0 → a，t=1 → b。
+fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |sh: u32| -> u32 {
+        let x = ((a >> sh) & 0xFF) as f32;
+        let y = ((b >> sh) & 0xFF) as f32;
+        (((x + (y - x) * t).round() as u32) & 0xFF) << sh
+    };
+    mix(16) | mix(8) | mix(0)
+}
+
 /// 自绘复选框绘制(处理主窗口 WM_DRAWITEM，勾选框 + 文字都跟随主题)。
-/// 返回 nonzero = 已处理该消息。
+/// 支持 hover/按压明暗反馈(系统经 itemState 传入)与子复选框的展开动画(整行向背景色
+/// 淡入淡出 + 从上方 ~10px 滑入)。返回 nonzero = 已处理该消息。
 unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
     use windows_sys::Win32::Graphics::Gdi::{
         CreatePen, LineTo, MoveToEx, RoundRect, PS_SOLID,
@@ -694,8 +745,25 @@ unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
     let hdc = dis.hDC;
     let rc = dis.rcItem;
 
-    // 背景：跟窗口一致，避免露出默认按钮底色
-    let bgbr = CreateSolidBrush(bg_color());
+    // hover/按压状态：BS_OWNERDRAW 按钮控件自己跟踪鼠标，经 itemState 告诉我们
+    let disabled = (dis.itemState & ODS_DISABLED) != 0;
+    let pressed = !disabled && (dis.itemState & ODS_SELECTED) != 0;
+    let hot = !disabled && !pressed && (dis.itemState & ODS_HOTLIGHT) != 0;
+
+    // 展开动画进度(仅子复选框参与)：p∈[0,1]，1 = 完全显示
+    let frame = if dis.CtlID == gui::ID_CHK_START_MINIMIZED {
+        SUB_ANIM_FRAME.load(Ordering::Relaxed)
+    } else {
+        SUB_ANIM_FRAMES
+    };
+    let p = frame as f32 / SUB_ANIM_FRAMES as f32;
+    let fade = 1.0 - p; // 1 = 完全融入背景，0 = 完全显示
+    // 滑入：内容从上方 ~10px 处滑到位(在控件自身 DC 内平移，不会盖住别的控件)
+    let dy = (-(1.0 - p) * 10.0).round() as i32;
+
+    // 背景：跟窗口一致，避免露出默认按钮底色(不参与淡入，始终不透明遮底)
+    let bg = bg_color();
+    let bgbr = CreateSolidBrush(bg);
     FillRect(hdc, &rc, bgbr);
     DeleteObject(bgbr);
 
@@ -710,13 +778,43 @@ unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
     let cy = (rc.bottom - rc.top) as f32;
     let box_sz = ((cy - 6.0).max(14.0).min(22.0)) as i32;
     let box_x = rc.left + 2;
-    let box_y = rc.top + (rc.bottom - rc.top - box_sz) / 2;
+    let box_y = rc.top + (rc.bottom - rc.top - box_sz) / 2 + dy;
     let r = (box_sz as f32 * 0.25) as i32; // 圆角半径
+
+    // 颜色：基色 → hover/按压明暗 → 动画淡入(向背景色融合)
+    let txt = text_color();
+    let (mut fill, mut border) = if checked {
+        (CHK_ACCENT, CHK_ACCENT)
+    } else {
+        (
+            edit_color(),
+            if is_dark() { CHK_BOX_BORDER_DARK } else { CHK_BOX_BORDER_LIGHT },
+        )
+    };
+    if hot {
+        if checked {
+            fill = lerp_color(fill, 0x00FFFFFF, 0.12); // 悬停：略微提亮
+        } else {
+            border = lerp_color(border, txt, 0.40); // 悬停：边框加深/加亮
+        }
+    }
+    if pressed {
+        if checked {
+            fill = lerp_color(fill, 0x00000000, 0.20); // 按下：明显加深
+        } else {
+            fill = lerp_color(fill, txt, 0.10);
+            border = lerp_color(border, txt, 0.55);
+        }
+    }
+    if fade > 0.0 {
+        fill = lerp_color(fill, bg, fade);
+        border = lerp_color(border, bg, fade);
+    }
 
     if checked {
         // 蓝底圆角 + 白勾
-        let br = CreateSolidBrush(CHK_ACCENT);
-        let pen = CreatePen(PS_SOLID, 1, CHK_ACCENT);
+        let br = CreateSolidBrush(fill);
+        let pen = CreatePen(PS_SOLID, 1, border);
         let oldbr = SelectObject(hdc, br);
         let oldpen = SelectObject(hdc, pen);
         RoundRect(hdc, box_x, box_y, box_x + box_sz, box_y + box_sz, r, r);
@@ -725,20 +823,20 @@ unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
         DeleteObject(br);
         DeleteObject(pen);
 
-        let cpen = CreatePen(PS_SOLID, 2, 0x00FFFFFF);
+        let check_c = lerp_color(0x00FFFFFF, bg, fade);
+        let cpen = CreatePen(PS_SOLID, 2, check_c);
         let oldcpen = SelectObject(hdc, cpen);
-        let mut p: POINT = std::mem::zeroed();
+        let mut prev_pt: POINT = std::mem::zeroed();
         let (x0, y0, s) = (box_x as f32, box_y as f32, box_sz as f32);
         // 画一个勾：起点 -> 折角 -> 终点
-        MoveToEx(hdc, (x0 + s * 0.22) as i32, (y0 + s * 0.53) as i32, &mut p);
+        MoveToEx(hdc, (x0 + s * 0.22) as i32, (y0 + s * 0.53) as i32, &mut prev_pt);
         LineTo(hdc, (x0 + s * 0.42) as i32, (y0 + s * 0.73) as i32);
         LineTo(hdc, (x0 + s * 0.80) as i32, (y0 + s * 0.27) as i32);
         SelectObject(hdc, oldcpen);
         DeleteObject(cpen);
     } else {
         // 空框：填充 + 边框
-        let br = CreateSolidBrush(edit_color());
-        let border = if is_dark() { CHK_BOX_BORDER_DARK } else { CHK_BOX_BORDER_LIGHT };
+        let br = CreateSolidBrush(fill);
         let pen = CreatePen(PS_SOLID, 1, border);
         let oldbr = SelectObject(hdc, br);
         let oldpen = SelectObject(hdc, pen);
@@ -749,11 +847,13 @@ unsafe fn draw_owner_checkbox(dis: &DRAWITEMSTRUCT) -> LRESULT {
         DeleteObject(pen);
     }
 
-    // 文字(theme 色，单行垂直居中)
+    // 文字(theme 色，单行垂直居中，随动画淡入 + 位移)
     if n > 0 {
         SetBkMode(hdc, 1); // TRANSPARENT
-        SetTextColor(hdc, text_color());
+        SetTextColor(hdc, lerp_color(txt, bg, fade));
         let mut tr = rc;
+        tr.top += dy;
+        tr.bottom += dy;
         tr.left = box_x + box_sz + 6;
         tr.right = rc.right - 2;
         // DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
@@ -1288,18 +1388,37 @@ unsafe fn toggle_checkbox(hwnd: HWND, id: u32) {
     }
 }
 
-/// "开机时只在托盘后台运行"子选项：跟随 auto_start 显示/隐藏(只动它，不触发整窗刷新)。
+/// "开机时只在托盘后台运行"子选项：跟随 auto_start 切换显隐，带 ~144ms 滑入/淡出动画。
+/// 只动它自己(局部重绘)，不触发整窗刷新；快速反复点击时从当前帧继续，不跳变。
 unsafe fn sync_sub_checkbox_visibility(hwnd: HWND) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDlgItem, ShowWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
     let show = APP_STATE
         .get()
         .and_then(|s| s.lock().ok())
         .map(|st| st.cfg.auto_start)
         .unwrap_or(false);
     let h = GetDlgItem(hwnd, gui::ID_CHK_START_MINIMIZED as i32);
-    if h != 0 {
-        ShowWindow(h, if show { 5 } else { 0 }); // 5=SW_SHOW, 0=SW_HIDE
+    if h == 0 {
+        return;
     }
+    let animating = SUB_ANIM_ACTIVE.load(Ordering::Relaxed);
+    // 已是目标状态且没在动画中：无事可做
+    if !animating && (IsWindowVisible(h) != 0) == show {
+        return;
+    }
+    SUB_ANIM_SHOWING.store(show, Ordering::Relaxed);
+    if !animating {
+        // 起点帧：展开从 0 → 满；收起从满 → 0
+        SUB_ANIM_FRAME.store(if show { 0 } else { SUB_ANIM_FRAMES }, Ordering::Relaxed);
+    }
+    SUB_ANIM_ACTIVE.store(true, Ordering::Relaxed);
+    if show {
+        ShowWindow(h, 5); // 5=SW_SHOW
+    }
+    SetTimer(hwnd, TIMER_SUBMENU, 16, None);
+    // 立即画出第一帧，避免首帧前有 16ms 空白
+    InvalidateRect(h, ptr::null(), 1);
+    UpdateWindow(h);
 }
 
 /// 开机静默启动复选框被点击：翻转 cfg.start_minimized 持久化。
