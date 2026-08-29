@@ -37,7 +37,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, CS_DROPSHADOW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, EnumChildWindows,
     GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-    GetMonitorInfoW, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
+    IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
     MessageBoxW, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
     SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TranslateMessage, DispatchMessageW,
@@ -131,7 +131,8 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
         // 保持 held 句柄在进程生命周期内不释放，作为单实例锁
-        std::mem::forget(held);
+        // （HANDLE 是 isize/Copy，无需也绝不能 CloseHandle；let _ 仅消除未使用告警）
+        let _ = held;
     }
 
     // 仅在自启动场景下由注册表 Run 项带入 --silent，意图是"不要弹主窗口、只在托盘里跑"。
