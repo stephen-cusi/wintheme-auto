@@ -1601,8 +1601,9 @@ unsafe fn measure_menu_item(lparam: LPARAM) -> LRESULT {
     if idx >= items.len() {
         return 0;
     }
+    let k = gui::dpi_scale_for_system();
     if items[idx].separator {
-        mis.itemHeight = 14;
+        mis.itemHeight = (12.0 * k).round() as u32;
         mis.itemWidth = 100;
         return 1;
     }
@@ -1619,8 +1620,9 @@ unsafe fn measure_menu_item(lparam: LPARAM) -> LRESULT {
     GetTextExtentPoint32W(hdc, text_w.as_ptr(), text_w.len() as i32, &mut size);
     SelectObject(hdc, prev_font);
     ReleaseDC(0, hdc);
-    // 左侧 check 区域 + 左右 padding
-    mis.itemWidth = (size.cx + 66) as u32;
+    // 左内边距 + ✓ 列 + 间隙 + 右内边距(全部随 DPI 缩放)；size.cx 是 i32，统一在 i32 里算
+    mis.itemWidth =
+        (size.cx + (14.0 * k).round() as i32 * 2 + (20.0 * k).round() as i32 + (6.0 * k).round() as i32) as u32;
     1
 }
 
@@ -1692,17 +1694,19 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
         return 1;
     }
 
-    // 悬停/选中：内缩 4px 的圆角高亮(像 Windows 安全中心菜单)
+    // 悬停/选中：内缩圆角高亮，中性灰(对齐 Defender/Win11 菜单的规整感)
     if selected {
-        let pad = 4;
+        let k = gui::dpi_scale_for_system();
+        let pad = (3.0 * k).round() as i32;
         let hr = RECT {
             left: rc.left + pad,
             top: rc.top + pad,
             right: rc.right - pad,
             bottom: rc.bottom - pad,
         };
-        let hl = if is_dark() { 0x3A3A3Au32 } else { 0xD8E4F2u32 };
-        let rgn = CreateRoundRectRgn(hr.left, hr.top, hr.right + 1, hr.bottom + 1, 8, 8);
+        let hl = if is_dark() { 0x3A3A3Au32 } else { 0xDEDEDEu32 };
+        let rad = (6.0 * k).round() as i32;
+        let rgn = CreateRoundRectRgn(hr.left, hr.top, hr.right + 1, hr.bottom + 1, rad, rad);
         let b = CreateSolidBrush(hl);
         FillRgn(hdc, rgn, b);
         DeleteObject(b);
@@ -1711,28 +1715,34 @@ unsafe fn draw_menu_item(lparam: LPARAM) -> LRESULT {
 
     // 用大号菜单字体画 ✓ 和文字
     let old_font = SelectObject(hdc, menu_font());
+    let k = gui::dpi_scale_for_system();
+    // 统一内边距：✓ 和文字全部左对齐(不再居中)，✓ 在紧贴文字的固定列
+    let pad_l = (14.0 * k).round() as i32;
+    let gutter = (20.0 * k).round() as i32;
+    let gap = (6.0 * k).round() as i32;
 
-    // 左侧 check 区域
+    // ✓ 列(固定位置，与文字左缘对齐成一条线；未勾选项同样留空，保证文字齐整)
     if item.checked {
-        // 画一个 ✓(用 Segoe UI Symbol 字符 ✓，U+2713)
+        // 画一个 ✓(Segoe UI Symbol 字符 ✓，U+2713)
         let check_w: Vec<u16> = "\u{2713}".encode_utf16().collect();
         let mut crc = rc;
-        crc.left += 8;
-        crc.right = crc.left + 24;
+        crc.left += pad_l;
+        crc.right = crc.left + gutter;
         SetBkMode(hdc, 1); // TRANSPARENT
         SetTextColor(hdc, fg);
-        DrawTextW(hdc, check_w.as_ptr(), check_w.len() as i32, &mut crc, 0x0025);
-        // 0x0025 = DT_CENTER(0x0001) | DT_VCENTER(0x0004) | DT_SINGLELINE(0x0020)
+        // DT_LEFT(0x0) | DT_VCENTER(0x4) | DT_SINGLELINE(0x20)
+        DrawTextW(hdc, check_w.as_ptr(), check_w.len() as i32, &mut crc, 0x0024);
     }
 
-    // 文字
+    // 文字：左对齐 + 统一内边距(规整的关键；原先 DT_CENTER 居中导致参差)。
+    // 未勾选项同样给 ✓ 列留空位，保证所有文字左缘对齐成一条线。
     let text_w: Vec<u16> = item.text.encode_utf16().collect();
     let mut trc = rc;
-    trc.left += 34; // 给 check 区域让位
-    trc.right -= 16;
+    trc.left += pad_l + gutter + gap;
+    trc.right -= pad_l;
     SetBkMode(hdc, 1);
     SetTextColor(hdc, fg);
-    DrawTextW(hdc, text_w.as_ptr(), text_w.len() as i32, &mut trc, 0x0025);
+    DrawTextW(hdc, text_w.as_ptr(), text_w.len() as i32, &mut trc, 0x0024);
 
     SelectObject(hdc, old_font);
     1
