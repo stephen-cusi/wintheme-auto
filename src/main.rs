@@ -13,7 +13,7 @@ mod theme;
 use anyhow::anyhow;
 use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
@@ -26,26 +26,27 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FillRgn, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, MonitorFromPoint, PAINTSTRUCT, ReleaseDC, ScreenToClient, SetBkColor,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect,
+    FillRgn, GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient, SetBkColor,
     SetBkMode, SetTextColor, SelectObject, UpdateWindow,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, CS_DROPSHADOW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, EnumChildWindows,
+    CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
+    AppendMenuW, CreatePopupMenu, EnumChildWindows,
     GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-    IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
+    IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MF_CHECKED, MF_OWNERDRAW,
     MessageBoxW, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
-    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TranslateMessage, DispatchMessageW,
+    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, DispatchMessageW,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT,
-    WM_TIMER, WNDCLASSW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_POPUP, HWND_MESSAGE, IDC_HAND,
+    WM_TIMER, WNDCLASSW, HWND_MESSAGE, IDC_HAND,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TRACKMOUSEEVENT, TrackMouseEvent,
+    TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED,
@@ -1539,245 +1540,8 @@ struct MenuItem {
 /// MENUITEMINFOW.dwItemData 存 index 进去(usize)，WM_DRAWITEM 时用 itemData 反查。
 static MENU_ITEMS: std::sync::Mutex<Vec<MenuItem>> = std::sync::Mutex::new(Vec::new());
 
-/// 完全自绘的托盘弹出菜单(替代 TrackPopupMenu)。
-/// 系统菜单窗口(#32768)的原生 1px 边框/uxtheme 主题缓存行为无法完全控制
-/// (浅色缓存下深色菜单总会留一圈细亮线，消息层与 DWM 层都拦不干净)，
-/// 干脆不用系统菜单窗口：无边框、圆角、投影、悬停高亮、勾选全部自己画。
-static MENU_HOVER: AtomicIsize = AtomicIsize::new(-1);
-/// 菜单所属的托盘窗口(选中条目后把命令发给它)。
-static MENU_OWNER: AtomicIsize = AtomicIsize::new(0);
-/// 每个条目在菜单窗口客户区里的矩形(与 MENU_ITEMS 同下标)。
-static MENU_ITEM_RECTS: std::sync::Mutex<Vec<RECT>> = std::sync::Mutex::new(Vec::new());
-static MENU_CLASS_OK: AtomicBool = AtomicBool::new(false);
-
-fn menu_class_name() -> &'static [u16] {
-    static N: OnceLock<Vec<u16>> = OnceLock::new();
-    N.get_or_init(|| {
-        let mut v: Vec<u16> = "WinThemeAutoMenu".encode_utf16().collect();
-        v.push(0);
-        v
-    })
-}
-
-/// 托盘菜单配色：(背景, 文字, 禁用文字, 悬停高亮)
-fn menu_palette() -> (u32, u32, u32, u32) {
-    if is_dark() {
-        (0x1F1F1F, 0xE8E8E8, 0x808080, 0x3A3A3A)
-    } else {
-        (0xF2F2F2, 0x1E1E1E, 0xA0A0A0, 0xDEDEDE)
-    }
-}
-
-/// 自绘菜单弹出窗口的窗口过程。
-/// 点击条目/回车 → 销毁窗口并执行命令；Esc/失去焦点 → 仅关闭。
-unsafe extern "system" fn menu_popup_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    const WM_PAINT: u32 = 0x000F;
-    const WM_ERASEBKGND: u32 = 0x0014;
-    const WM_KILLFOCUS: u32 = 0x0008;
-    const WM_KEYDOWN: u32 = 0x0100;
-    const WM_MOUSEMOVE: u32 = 0x0200;
-    const WM_LBUTTONUP: u32 = 0x0202;
-    const WM_MOUSELEAVE: u32 = 0x02A3;
-    const VK_ESCAPE: usize = 0x1B;
-    const VK_RETURN: usize = 0x0D;
-    const VK_UP: usize = 0x26;
-    const VK_DOWN: usize = 0x28;
-
-    match msg {
-        WM_ERASEBKGND => {
-            let hdc = wparam as isize;
-            if hdc != 0 {
-                let mut rc: RECT = std::mem::zeroed();
-                GetClientRect(hwnd, &mut rc);
-                let (bg, _, _, _) = menu_palette();
-                let brush = CreateSolidBrush(bg);
-                FillRect(hdc, &rc, brush);
-                DeleteObject(brush);
-            }
-            1
-        }
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            draw_menu_popup(hwnd, hdc);
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_MOUSEMOVE => {
-            let hit = menu_hit_index(lparam);
-            let prev = MENU_HOVER.swap(hit, Ordering::Relaxed);
-            if prev != hit {
-                if prev == -1 && hit != -1 {
-                    // 刚进入条目区：跟踪鼠标移出
-                    let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
-                    tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
-                    tme.dwFlags = 2; // TME_LEAVE
-                    tme.hwndTrack = hwnd;
-                    TrackMouseEvent(&mut tme);
-                }
-                InvalidateRect(hwnd, std::ptr::null(), 1);
-            }
-            0
-        }
-        WM_MOUSELEAVE => {
-            if MENU_HOVER.swap(-1, Ordering::Relaxed) != -1 {
-                InvalidateRect(hwnd, std::ptr::null(), 1);
-            }
-            0
-        }
-        WM_LBUTTONUP => {
-            let idx = menu_hit_index(lparam);
-            let id = if idx >= 0 {
-                MENU_ITEMS.lock().unwrap()[idx as usize].id
-            } else {
-                0
-            };
-            if id != 0 {
-                // 先关菜单再执行命令(退出命令会销毁主窗口)
-                DestroyWindow(hwnd);
-                let owner = MENU_OWNER.load(Ordering::Relaxed);
-                if owner != 0 {
-                    handle_menu_cmd(owner as HWND, id);
-                }
-            }
-            0
-        }
-        WM_KEYDOWN => {
-            if wparam == VK_ESCAPE {
-                DestroyWindow(hwnd);
-            } else if wparam == VK_RETURN {
-                let h = MENU_HOVER.load(Ordering::Relaxed);
-                if h >= 0 {
-                    let id = MENU_ITEMS.lock().unwrap()[h as usize].id;
-                    if id != 0 {
-                        DestroyWindow(hwnd);
-                        let owner = MENU_OWNER.load(Ordering::Relaxed);
-                        if owner != 0 {
-                            handle_menu_cmd(owner as HWND, id);
-                        }
-                    }
-                }
-            } else if wparam == VK_UP || wparam == VK_DOWN {
-                let dir: isize = if wparam == VK_UP { -1 } else { 1 };
-                let h = {
-                    let rects = MENU_ITEM_RECTS.lock().unwrap();
-                    let items = MENU_ITEMS.lock().unwrap();
-                    let n = rects.len() as isize;
-                    let mut cur = MENU_HOVER.load(Ordering::Relaxed);
-                    for _ in 0..n {
-                        cur = if cur < 0 {
-                            if dir > 0 { 0 } else { n - 1 }
-                        } else {
-                            (cur + dir + n) % n
-                        };
-                        if !items[cur as usize].separator {
-                            break;
-                        }
-                    }
-                    cur
-                };
-                if MENU_HOVER.swap(h, Ordering::Relaxed) != h {
-                    InvalidateRect(hwnd, std::ptr::null(), 1);
-                }
-            }
-            0
-        }
-        WM_KILLFOCUS => {
-            // 点击菜单外任何地方 = 关闭(与系统菜单行为一致)
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => 0,
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// 命中测试：鼠标坐标(lParam)落在哪个条目里，返回下标；无/分隔线返回 -1。
-fn menu_hit_index(lparam: LPARAM) -> isize {
-    let x = (lparam & 0xFFFF) as u16 as i32;
-    let y = ((lparam >> 16) & 0xFFFF) as u16 as i32;
-    let rects = MENU_ITEM_RECTS.lock().unwrap();
-    for (i, r) in rects.iter().enumerate() {
-        if x >= r.left && x < r.right && y >= r.top && y < r.bottom {
-            let items = MENU_ITEMS.lock().unwrap();
-            if !items[i].separator {
-                return i as isize;
-            }
-            return -1;
-        }
-    }
-    -1
-}
-
-/// 画出整个弹出菜单(背景 + 每个条目)，供 WM_PAINT 调用。
-unsafe fn draw_menu_popup(hwnd: HWND, hdc: isize) {
-    let (bg, fg_text, fg_gray, hover_bg) = menu_palette();
-    let k = gui::dpi_scale_for_system();
-    let pad_l = (14.0 * k).round() as i32;
-    let gutter = (20.0 * k).round() as i32;
-    let gap = (6.0 * k).round() as i32;
-
-    // 整窗背景
-    let mut rc: RECT = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rc);
-    let brush = CreateSolidBrush(bg);
-    FillRect(hdc, &rc, brush);
-    DeleteObject(brush);
-
-    let old_font = SelectObject(hdc, menu_font());
-    SetBkMode(hdc, 1); // TRANSPARENT
-    let rects = MENU_ITEM_RECTS.lock().unwrap();
-    let items = MENU_ITEMS.lock().unwrap();
-    let hover = MENU_HOVER.load(Ordering::Relaxed);
-    for (i, r) in rects.iter().enumerate() {
-        let it = &items[i];
-        if it.separator {
-            continue; // 分隔 = 空白间隙(背景色)，与系统菜单观感一致
-        }
-        let grayed = !it.enabled;
-        // 悬停高亮：内缩圆角矩形(Defender 风格)
-        if i as isize == hover && !grayed {
-            let pad = (3.0 * k).round() as i32;
-            let hr = RECT {
-                left: r.left + pad,
-                top: r.top + pad,
-                right: r.right - pad,
-                bottom: r.bottom - pad,
-            };
-            let rad = (6.0 * k).round() as i32;
-            let rgn = CreateRoundRectRgn(hr.left, hr.top, hr.right + 1, hr.bottom + 1, rad, rad);
-            let b = CreateSolidBrush(hover_bg);
-            FillRgn(hdc, rgn, b);
-            DeleteObject(b);
-            DeleteObject(rgn);
-        }
-        let fg = if grayed { fg_gray } else { fg_text };
-        // ✓ 列(所有条目统一预留，文字左缘对齐成一条线)
-        if it.checked {
-            let check_w: Vec<u16> = "\u{2713}".encode_utf16().collect();
-            let mut crc = *r;
-            crc.left += pad_l;
-            crc.right = crc.left + gutter;
-            SetTextColor(hdc, fg);
-            // DT_LEFT | DT_VCENTER | DT_SINGLELINE
-            DrawTextW(hdc, check_w.as_ptr(), check_w.len() as i32, &mut crc, 0x0024);
-        }
-        // 文字(左对齐 + 统一内边距)
-        let text_w: Vec<u16> = it.text.encode_utf16().collect();
-        let mut trc = *r;
-        trc.left += pad_l + gutter + gap;
-        trc.right -= pad_l;
-        SetTextColor(hdc, fg);
-        DrawTextW(hdc, text_w.as_ptr(), text_w.len() as i32, &mut trc, 0x0024);
-    }
-    SelectObject(hdc, old_font);
-}
-
+/// 弹出托盘菜单：原生 TrackPopupMenu 承担弹出/键盘/点击外部消散；
+/// 条目仍 owner-draw(由 wnd_proc 的 WM_MEASUREITEM/WM_DRAWITEM 自绘深浅色)。
 unsafe fn show_menu(hwnd: HWND) {
     let (mode, cur) = {
         let lock = APP_STATE.get().unwrap().lock().unwrap();
@@ -1796,115 +1560,42 @@ unsafe fn show_menu(hwnd: HWND) {
     items.push(MenuItem { id: 0,           text: String::new(), separator: true,  checked: false, enabled: true });
     items.push(MenuItem { id: ID_EXIT,     text: "退出".to_string(),         separator: false, checked: false, enabled: true });
 
-    // 替换全局菜单快照(绘制/命中测试都从这份快照读)
+    // 替换全局菜单快照(绘制时按 itemData 索引反查)
     {
         let mut g = MENU_ITEMS.lock().unwrap();
         *g = items;
     }
 
-    // ---- 布局：算出窗口尺寸与每个条目的矩形(窗口坐标系) ----
-    let k = gui::dpi_scale_for_system();
-    let item_h = menu_item_height() as i32;
-    let sep_h = (12.0 * k).round() as i32;
-    let pad_l = (14.0 * k).round() as i32;
-    let gutter = (20.0 * k).round() as i32;
-    let gap = (6.0 * k).round() as i32;
-    let pad_r = (14.0 * k).round() as i32;
-
-    let mut rects: Vec<RECT> = Vec::new();
-    let mut max_w: i32 = 0;
-    let mut total_h: i32 = 0;
-    {
-        let hdc = GetDC(0);
-        let prev_font = SelectObject(hdc, menu_font());
-        let items_ref = MENU_ITEMS.lock().unwrap();
-        for it in items_ref.iter() {
-            let h = if it.separator { sep_h } else { item_h };
-            if !it.separator {
-                let tw: Vec<u16> = it.text.encode_utf16().collect();
-                let mut size = SIZE { cx: 0, cy: 0 };
-                GetTextExtentPoint32W(hdc, tw.as_ptr(), tw.len() as i32, &mut size);
-                let w = pad_l + gutter + gap + size.cx + pad_r;
-                if w > max_w {
-                    max_w = w;
-                }
-            }
-            rects.push(RECT { left: 0, top: total_h, right: 0, bottom: total_h + h });
-            total_h += h;
-        }
-        SelectObject(hdc, prev_font);
-        ReleaseDC(0, hdc);
-    }
-    for r in rects.iter_mut() {
-        r.right = max_w;
-    }
-    let (menu_w, menu_h) = (max_w, total_h);
-
-    // ---- 位置：光标处弹出，夹到最近显示器的工作区内(多显示器/任务栏安全) ----
-    let mut pt = POINT { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
-    let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    let mut minfo: MONITORINFO = std::mem::zeroed();
-    minfo.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    GetMonitorInfoW(mon, &mut minfo);
-    let mut x = pt.x;
-    let mut ypos = pt.y;
-    if x + menu_w > minfo.rcWork.right {
-        x = minfo.rcWork.right - menu_w;
-    }
-    if ypos + menu_h > minfo.rcWork.bottom {
-        ypos = minfo.rcWork.bottom - menu_h;
-    }
-    if x < minfo.rcWork.left {
-        x = minfo.rcWork.left;
-    }
-    if ypos < minfo.rcWork.top {
-        ypos = minfo.rcWork.top;
-    }
-
-    *MENU_ITEM_RECTS.lock().unwrap() = rects;
-    MENU_HOVER.store(-1, Ordering::Relaxed);
-    MENU_OWNER.store(hwnd, Ordering::Relaxed);
-
-    // ---- 注册窗口类(一次)并弹出无边框窗口 ----
-    if !MENU_CLASS_OK.load(Ordering::Relaxed) {
-        let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.style = CS_DROPSHADOW; // 系统菜单同款投影
-        wc.lpfnWndProc = Some(menu_popup_proc);
-        wc.hInstance = GetModuleHandleW(std::ptr::null());
-        wc.hCursor = LoadCursorW(0, IDC_ARROW);
-        wc.lpszClassName = menu_class_name().as_ptr();
-        RegisterClassW(&wc);
-        MENU_CLASS_OK.store(true, Ordering::Relaxed);
-    }
-    const EMPTY_TITLE: [u16; 1] = [0];
-    let menu_hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // 置顶、不进任务栏/Alt-Tab
-        menu_class_name().as_ptr(),
-        EMPTY_TITLE.as_ptr(),
-        WS_POPUP, // 无边框
-        x, ypos, menu_w, menu_h,
-        0, 0,
-        GetModuleHandleW(std::ptr::null()),
-        std::ptr::null(),
-    );
-    if menu_hwnd == 0 {
-        MENU_ITEMS.lock().unwrap().clear();
+    let menu = CreatePopupMenu();
+    if menu == 0 {
         return;
     }
-    // Win11：圆角(旧系统调用失败忽略)；投影由 CS_DROPSHADOW 提供
-    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-    let round: u32 = 2; // DWMWCP_ROUND
-    DwmSetWindowAttribute(
-        menu_hwnd,
-        33, // DWMWA_WINDOW_CORNER_PREFERENCE
-        &round as *const u32 as *const core::ffi::c_void,
-        4,
-    );
+    {
+        let items = MENU_ITEMS.lock().unwrap();
+        for (i, it) in items.iter().enumerate() {
+            // 分隔线同样 owner-draw(id=0)：与条目同底色的无缝分隔
+            let flags = MF_OWNERDRAW | if it.checked { MF_CHECKED } else { 0 };
+            AppendMenuW(menu, flags, it.id as usize, i as *const u16);
+        }
+    }
 
-    ShowWindow(menu_hwnd, SW_SHOWNORMAL);
-    SetForegroundWindow(menu_hwnd);
-    SetFocus(menu_hwnd); // 拿到焦点：点击外部(KILLFOCUS)关闭 + 支持键盘
+    // 经典托盘菜单模式(KB135788)：先 SetForegroundWindow，TrackPopupMenu 才能在
+    // 点击外部时消散；结束后补发 WM_NULL 修正焦点归属。
+    SetForegroundWindow(hwnd);
+    let mut pt = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut pt);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD,
+        pt.x, pt.y,
+        0, hwnd,
+        std::ptr::null(),
+    );
+    PostMessageW(hwnd, 0x0000, 0, 0); // WM_NULL
+    DestroyMenu(menu);
+    if cmd != 0 {
+        handle_menu_cmd(hwnd, cmd as u32);
+    }
 }
 
 /// 处理 WM_MEASUREITEM：返回每条菜单项的尺寸。
