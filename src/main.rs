@@ -19,36 +19,34 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
 use windows_sys::core::PCSTR;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FillRgn, GetDC,
-    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient, SetBkColor, SetBkMode,
-    SetTextColor, SelectObject, UpdateWindow,
+    BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    FillRgn, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MonitorFromPoint, PAINTSTRUCT, ReleaseDC, ScreenToClient, SetBkColor,
+    SetBkMode, SetTextColor, SelectObject, UpdateWindow,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CallWindowProcW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT,
-    DefWindowProcW, DestroyMenu, DestroyWindow, EnumChildWindows, GetClientRect, GetCursorPos,
-    GetDlgItem, GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowLongPtrW, IDC_ARROW,
-    InsertMenuItemW, IsWindowVisible, KillTimer, LoadCursorW, MENUINFO, MENUITEMINFOW, MFS_CHECKED,
-    MFS_DISABLED, MFS_ENABLED, MFT_OWNERDRAW, MIM_APPLYTOSUBMENUS, MIM_BACKGROUND, MIIM_DATA,
-    MIIM_FTYPE, MIIM_ID, MIIM_STATE, SetMenuInfo,
-    MessageBoxW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, SetWindowsHookExW, SW_HIDE,
-    SW_SHOWNORMAL, TrackPopupMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON, TranslateMessage,
-    DispatchMessageW, UnhookWindowsHookEx, WM_CLOSE, WM_COMMAND, WM_CREATE, WNDPROC,
-    WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW,
-    HWND_MESSAGE, IDC_HAND,
+    CreateWindowExW, CS_DROPSHADOW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, EnumChildWindows,
+    GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetMonitorInfoW, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW,
+    MessageBoxW, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TranslateMessage, DispatchMessageW,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT,
+    WM_TIMER, WNDCLASSW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_POPUP, HWND_MESSAGE, IDC_HAND,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TRACKMOUSEEVENT, TrackMouseEvent};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED,
     ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_BUTTON, ODT_MENU,
@@ -1540,112 +1538,243 @@ struct MenuItem {
 /// MENUITEMINFOW.dwItemData 存 index 进去(usize)，WM_DRAWITEM 时用 itemData 反查。
 static MENU_ITEMS: std::sync::Mutex<Vec<MenuItem>> = std::sync::Mutex::new(Vec::new());
 
-/// TrackPopupMenu 的菜单窗口是系统即时创建的，其非客户区边框默认跟随系统亮色主题
-/// ——这就是深色菜单外圈那圈白边的来源。WH_CBT 钩子在菜单窗口激活的瞬间拿到它的
-/// hwnd，对其应用 AllowDarkModeForWindow(跟随应用当前主题)，边框即随应用变深/变浅。
-/// 这是 win32 深色菜单的标准做法(uxtheme 非公开 API 缺失时静默降级为亮色边框)。
-unsafe extern "system" fn menu_dark_cbt_proc(
-    n_code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    const HCBT_CREATEWND: i32 = 3;
-    const HCBT_ACTIVATE: i32 = 5;
-    if n_code == HCBT_CREATEWND || n_code == HCBT_ACTIVATE {
-        let h = wparam as HWND;
-        // 注意：CBT 通知对本线程内任何窗口都会触发(比如菜单关闭后前台窗口重新激活)。
-        // 绝不能把主窗口也子类化掉——只认系统菜单窗口类 "#32768"。
-        if is_menu_window(h) {
-            // 关键保护：别把已经子类化的窗口再包一层(那会把自己当原过程，递归爆栈)
-            let cur = GetWindowLongPtrW(h, GWLP_WNDPROC);
-            if cur != menu_nc_proc as isize {
-                setup_menu_window(h);
-            }
-        }
+/// 完全自绘的托盘弹出菜单(替代 TrackPopupMenu)。
+/// 系统菜单窗口(#32768)的原生 1px 边框/uxtheme 主题缓存行为无法完全控制
+/// (浅色缓存下深色菜单总会留一圈细亮线，消息层与 DWM 层都拦不干净)，
+/// 干脆不用系统菜单窗口：无边框、圆角、投影、悬停高亮、勾选全部自己画。
+static MENU_HOVER: AtomicIsize = AtomicIsize::new(-1);
+/// 菜单所属的托盘窗口(选中条目后把命令发给它)。
+static MENU_OWNER: AtomicIsize = AtomicIsize::new(0);
+/// 每个条目在菜单窗口客户区里的矩形(与 MENU_ITEMS 同下标)。
+static MENU_ITEM_RECTS: std::sync::Mutex<Vec<RECT>> = std::sync::Mutex::new(Vec::new());
+static MENU_CLASS_OK: AtomicBool = AtomicBool::new(false);
+
+fn menu_class_name() -> &'static [u16] {
+    static N: OnceLock<Vec<u16>> = OnceLock::new();
+    N.get_or_init(|| {
+        let mut v: Vec<u16> = "WinThemeAutoMenu".encode_utf16().collect();
+        v.push(0);
+        v
+    })
+}
+
+/// 托盘菜单配色：(背景, 文字, 禁用文字, 悬停高亮)
+fn menu_palette() -> (u32, u32, u32, u32) {
+    if is_dark() {
+        (0x1F1F1F, 0xE8E8E8, 0x808080, 0x3A3A3A)
+    } else {
+        (0xF2F2F2, 0x1E1E1E, 0xA0A0A0, 0xDEDEDE)
     }
-    CallNextHookEx(0, n_code, wparam, lparam)
 }
 
-/// 判断 hwnd 是否为系统弹出菜单窗口(类名 "#32768")。
-unsafe fn is_menu_window(h: HWND) -> bool {
-    let want: Vec<u16> = "#32768".encode_utf16().collect();
-    let mut cls = [0u16; 8];
-    let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
-    n == want.len() as i32 && cls[..want.len()] == want[..]
-}
-
-/// 对菜单窗口应用深色 + 去边框 + 圆角。
-/// 在 HCBT_CREATEWND(刚创建、首帧绘制前)调用是关键——等 ACTIVATE 再做，
-/// 菜单可能已经用原过程画过一遍亮色背景/边框，留下 1px 细线。
-unsafe fn setup_menu_window(h: HWND) {
-    allow_dark_window(h, is_dark());
-    // 吞掉 NC 边框绘制(含主题引擎的私有 NC 消息)，客户区背景按主题刷
-    let prev = SetWindowLongPtrW(h, GWLP_WNDPROC, menu_nc_proc as isize);
-    MENU_ORIG_PROC.store(prev, Ordering::Relaxed);
-    // Win11 22H2+ 的 DWM 在合成时给窗口画 1px 边框(消息层拦不住)，用 DWM 属性去掉
-    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-    let none_color: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE = 无边框
-    DwmSetWindowAttribute(
-        h,
-        34, // DWMWA_BORDER_COLOR
-        &none_color as *const u32 as *const core::ffi::c_void,
-        4,
-    );
-    // Win11：菜单窗口圆角(对齐 Defender 风格；旧系统调用失败，忽略)
-    let round: u32 = 2; // DWMWCP_ROUND
-    DwmSetWindowAttribute(
-        h,
-        33, // DWMWA_WINDOW_CORNER_PREFERENCE
-        &round as *const u32 as *const core::ffi::c_void,
-        4,
-    );
-    log(&format!(
-        "托盘菜单弹出: 深色={}, 已应用去边框/圆角",
-        is_dark()
-    ));
-}
-
-const GWLP_WNDPROC: i32 = -4;
-/// 被子类化的菜单窗口的原窗口过程(同一时间只有一个托盘菜单)。
-static MENU_ORIG_PROC: AtomicIsize = AtomicIsize::new(0);
-
-/// 菜单窗口的子类过程：
-/// - 不画 NC 边框(WM_NCPAINT 与主题引擎私有的 0xAE/0xAF)；
-/// - 客户区背景(条目矩形周围系统保留的 inset 空隙)自己按主题刷——菜单窗口默认
-///   用系统"菜单背景色"(亮色=白)填充，这就是深色菜单白边的真正来源；
-/// 其余消息全部转发给原过程。
-unsafe extern "system" fn menu_nc_proc(
+/// 自绘菜单弹出窗口的窗口过程。
+/// 点击条目/回车 → 销毁窗口并执行命令；Esc/失去焦点 → 仅关闭。
+unsafe extern "system" fn menu_popup_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    const WM_NCPAINT: u32 = 0x0085;
-    const WM_NCUAHDRAWCAPTION: u32 = 0x00AE; // 主题引擎画 NC 标题(未公开)
-    const WM_NCUAHDRAWFRAME: u32 = 0x00AF; // 主题引擎画 NC 边框(未公开)
+    const WM_PAINT: u32 = 0x000F;
     const WM_ERASEBKGND: u32 = 0x0014;
-    const WM_PRINTCLIENT: u32 = 0x03B8;
-    if msg == WM_NCPAINT || msg == WM_NCUAHDRAWCAPTION || msg == WM_NCUAHDRAWFRAME {
-        return 0; // 已处理 = 什么都不画
-    }
-    if msg == WM_ERASEBKGND || msg == WM_PRINTCLIENT {
-        let hdc = wparam as isize;
-        if hdc != 0 {
-            let mut rc: RECT = std::mem::zeroed();
-            GetClientRect(hwnd, &mut rc);
-            let brush = CreateSolidBrush(bg_color());
-            FillRect(hdc, &rc, brush);
-            DeleteObject(brush);
+    const WM_KILLFOCUS: u32 = 0x0008;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_MOUSEMOVE: u32 = 0x0200;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+    const VK_ESCAPE: usize = 0x1B;
+    const VK_RETURN: usize = 0x0D;
+    const VK_UP: usize = 0x26;
+    const VK_DOWN: usize = 0x28;
+
+    match msg {
+        WM_ERASEBKGND => {
+            let hdc = wparam as isize;
+            if hdc != 0 {
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let (bg, _, _, _) = menu_palette();
+                let brush = CreateSolidBrush(bg);
+                FillRect(hdc, &rc, brush);
+                DeleteObject(brush);
+            }
+            1
         }
-        return 1; // 背景已由我们刷成主题色
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            draw_menu_popup(hwnd, hdc);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_MOUSEMOVE => {
+            let hit = menu_hit_index(lparam);
+            let prev = MENU_HOVER.swap(hit, Ordering::Relaxed);
+            if prev != hit {
+                if prev == -1 && hit != -1 {
+                    // 刚进入条目区：跟踪鼠标移出
+                    let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
+                    tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+                    tme.dwFlags = 2; // TME_LEAVE
+                    tme.hwndTrack = hwnd;
+                    TrackMouseEvent(&mut tme);
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            if MENU_HOVER.swap(-1, Ordering::Relaxed) != -1 {
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let idx = menu_hit_index(lparam);
+            let id = if idx >= 0 {
+                MENU_ITEMS.lock().unwrap()[idx as usize].id
+            } else {
+                0
+            };
+            if id != 0 {
+                // 先关菜单再执行命令(退出命令会销毁主窗口)
+                DestroyWindow(hwnd);
+                let owner = MENU_OWNER.load(Ordering::Relaxed);
+                if owner != 0 {
+                    handle_menu_cmd(owner as HWND, id);
+                }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if wparam == VK_ESCAPE {
+                DestroyWindow(hwnd);
+            } else if wparam == VK_RETURN {
+                let h = MENU_HOVER.load(Ordering::Relaxed);
+                if h >= 0 {
+                    let id = MENU_ITEMS.lock().unwrap()[h as usize].id;
+                    if id != 0 {
+                        DestroyWindow(hwnd);
+                        let owner = MENU_OWNER.load(Ordering::Relaxed);
+                        if owner != 0 {
+                            handle_menu_cmd(owner as HWND, id);
+                        }
+                    }
+                }
+            } else if wparam == VK_UP || wparam == VK_DOWN {
+                let dir: isize = if wparam == VK_UP { -1 } else { 1 };
+                let h = {
+                    let rects = MENU_ITEM_RECTS.lock().unwrap();
+                    let items = MENU_ITEMS.lock().unwrap();
+                    let n = rects.len() as isize;
+                    let mut cur = MENU_HOVER.load(Ordering::Relaxed);
+                    for _ in 0..n {
+                        cur = if cur < 0 {
+                            if dir > 0 { 0 } else { n - 1 }
+                        } else {
+                            (cur + dir + n) % n
+                        };
+                        if !items[cur as usize].separator {
+                            break;
+                        }
+                    }
+                    cur
+                };
+                if MENU_HOVER.swap(h, Ordering::Relaxed) != h {
+                    InvalidateRect(hwnd, std::ptr::null(), 1);
+                }
+            }
+            0
+        }
+        WM_KILLFOCUS => {
+            // 点击菜单外任何地方 = 关闭(与系统菜单行为一致)
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => 0,
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-    let orig = MENU_ORIG_PROC.load(Ordering::Relaxed);
-    if orig != 0 {
-        let proc: WNDPROC = std::mem::transmute(orig);
-        CallWindowProcW(proc, hwnd, msg, wparam, lparam)
-    } else {
-        DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 命中测试：鼠标坐标(lParam)落在哪个条目里，返回下标；无/分隔线返回 -1。
+fn menu_hit_index(lparam: LPARAM) -> isize {
+    let x = (lparam & 0xFFFF) as u16 as i32;
+    let y = ((lparam >> 16) & 0xFFFF) as u16 as i32;
+    let rects = MENU_ITEM_RECTS.lock().unwrap();
+    for (i, r) in rects.iter().enumerate() {
+        if x >= r.left && x < r.right && y >= r.top && y < r.bottom {
+            let items = MENU_ITEMS.lock().unwrap();
+            if !items[i].separator {
+                return i as isize;
+            }
+            return -1;
+        }
     }
+    -1
+}
+
+/// 画出整个弹出菜单(背景 + 每个条目)，供 WM_PAINT 调用。
+unsafe fn draw_menu_popup(hwnd: HWND, hdc: isize) {
+    let (bg, fg_text, fg_gray, hover_bg) = menu_palette();
+    let k = gui::dpi_scale_for_system();
+    let pad_l = (14.0 * k).round() as i32;
+    let gutter = (20.0 * k).round() as i32;
+    let gap = (6.0 * k).round() as i32;
+
+    // 整窗背景
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let brush = CreateSolidBrush(bg);
+    FillRect(hdc, &rc, brush);
+    DeleteObject(brush);
+
+    let old_font = SelectObject(hdc, menu_font());
+    SetBkMode(hdc, 1); // TRANSPARENT
+    let rects = MENU_ITEM_RECTS.lock().unwrap();
+    let items = MENU_ITEMS.lock().unwrap();
+    let hover = MENU_HOVER.load(Ordering::Relaxed);
+    for (i, r) in rects.iter().enumerate() {
+        let it = &items[i];
+        if it.separator {
+            continue; // 分隔 = 空白间隙(背景色)，与系统菜单观感一致
+        }
+        let grayed = !it.enabled;
+        // 悬停高亮：内缩圆角矩形(Defender 风格)
+        if i as isize == hover && !grayed {
+            let pad = (3.0 * k).round() as i32;
+            let hr = RECT {
+                left: r.left + pad,
+                top: r.top + pad,
+                right: r.right - pad,
+                bottom: r.bottom - pad,
+            };
+            let rad = (6.0 * k).round() as i32;
+            let rgn = CreateRoundRectRgn(hr.left, hr.top, hr.right + 1, hr.bottom + 1, rad, rad);
+            let b = CreateSolidBrush(hover_bg);
+            FillRgn(hdc, rgn, b);
+            DeleteObject(b);
+            DeleteObject(rgn);
+        }
+        let fg = if grayed { fg_gray } else { fg_text };
+        // ✓ 列(所有条目统一预留，文字左缘对齐成一条线)
+        if it.checked {
+            let check_w: Vec<u16> = "\u{2713}".encode_utf16().collect();
+            let mut crc = *r;
+            crc.left += pad_l;
+            crc.right = crc.left + gutter;
+            SetTextColor(hdc, fg);
+            // DT_LEFT | DT_VCENTER | DT_SINGLELINE
+            DrawTextW(hdc, check_w.as_ptr(), check_w.len() as i32, &mut crc, 0x0024);
+        }
+        // 文字(左对齐 + 统一内边距)
+        let text_w: Vec<u16> = it.text.encode_utf16().collect();
+        let mut trc = *r;
+        trc.left += pad_l + gutter + gap;
+        trc.right -= pad_l;
+        SetTextColor(hdc, fg);
+        DrawTextW(hdc, text_w.as_ptr(), text_w.len() as i32, &mut trc, 0x0024);
+    }
+    SelectObject(hdc, old_font);
 }
 
 unsafe fn show_menu(hwnd: HWND) {
@@ -1666,70 +1795,115 @@ unsafe fn show_menu(hwnd: HWND) {
     items.push(MenuItem { id: 0,           text: String::new(), separator: true,  checked: false, enabled: true });
     items.push(MenuItem { id: ID_EXIT,     text: "退出".to_string(),         separator: false, checked: false, enabled: true });
 
-    // 替换全局菜单快照(在创建 HMENU 之前，这样 InsertMenuItemW 时不会被其他线程读到旧数据)
+    // 替换全局菜单快照(绘制/命中测试都从这份快照读)
     {
         let mut g = MENU_ITEMS.lock().unwrap();
         *g = items;
     }
 
-    let menu = CreatePopupMenu();
+    // ---- 布局：算出窗口尺寸与每个条目的矩形(窗口坐标系) ----
+    let k = gui::dpi_scale_for_system();
+    let item_h = menu_item_height() as i32;
+    let sep_h = (12.0 * k).round() as i32;
+    let pad_l = (14.0 * k).round() as i32;
+    let gutter = (20.0 * k).round() as i32;
+    let gap = (6.0 * k).round() as i32;
+    let pad_r = (14.0 * k).round() as i32;
+
+    let mut rects: Vec<RECT> = Vec::new();
+    let mut max_w: i32 = 0;
+    let mut total_h: i32 = 0;
     {
+        let hdc = GetDC(0);
+        let prev_font = SelectObject(hdc, menu_font());
         let items_ref = MENU_ITEMS.lock().unwrap();
-        for (idx, item) in items_ref.iter().enumerate() {
-            let mut mii: MENUITEMINFOW = std::mem::zeroed();
-            mii.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
-            mii.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE;
-            // 关键：MFT_SEPARATOR 走系统绘制，无法用我们自定义的高度/线宽。
-// 改用 MFT_OWNERDRAW 让我们自己画 separator（draw_menu_item 已处理）。
-mii.fType = MFT_OWNERDRAW;
-            mii.wID = item.id;
-            mii.fState = (if item.checked { MFS_CHECKED } else { 0u32 })
-                      | (if item.enabled { MFS_ENABLED } else { MFS_DISABLED });
-            mii.dwItemData = idx;
-            InsertMenuItemW(menu, idx as u32, 1, &mii);
+        for it in items_ref.iter() {
+            let h = if it.separator { sep_h } else { item_h };
+            if !it.separator {
+                let tw: Vec<u16> = it.text.encode_utf16().collect();
+                let mut size = SIZE { cx: 0, cy: 0 };
+                GetTextExtentPoint32W(hdc, tw.as_ptr(), tw.len() as i32, &mut size);
+                let w = pad_l + gutter + gap + size.cx + pad_r;
+                if w > max_w {
+                    max_w = w;
+                }
+            }
+            rects.push(RECT { left: 0, top: total_h, right: 0, bottom: total_h + h });
+            total_h += h;
         }
+        SelectObject(hdc, prev_font);
+        ReleaseDC(0, hdc);
     }
+    for r in rects.iter_mut() {
+        r.right = max_w;
+    }
+    let (menu_w, menu_h) = (max_w, total_h);
 
-    // 菜单窗口背景刷：条目矩形四周系统保留的 inset 空隙用这个刷子填。
-    // 不设置的话默认用系统"菜单背景色"(亮色=白)——这就是深色菜单四周发白的来源之一。
-    // 刷子在 DestroyMenu 之后才删除。
-    let menu_brush = CreateSolidBrush(bg_color());
-    let mut mi: MENUINFO = std::mem::zeroed();
-    mi.cbSize = std::mem::size_of::<MENUINFO>() as u32;
-    mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
-    mi.hbrBack = menu_brush;
-    SetMenuInfo(menu, &mi);
-
+    // ---- 位置：光标处弹出，夹到最近显示器的工作区内(多显示器/任务栏安全) ----
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
-    SetForegroundWindow(hwnd);
-    // 菜单窗口的原生 chrome(1px 边框、边距)按当前主题强制重取：
-    // AllowDark 模式下 uxtheme 可能持着进程启动时的旧主题缓存——系统后来切了深色，
-    // 菜单的 1px 原生边框仍按浅色画(自绘条目盖不住它，就是剩下那圈细线)。
-    // 弹出前 Force + Flush，结束后恢复 AllowDark 跟随系统。
-    set_preferred_app_mode(if is_dark() { 2 } else { 3 }); // ForceDark / ForceLight
-    flush_menu_themes();
-    // 挂 CBT 钩子给即将弹出的菜单窗口上深色(消除深色菜单的白边框)
-    const WH_CBT: i32 = 5;
-    let hook = SetWindowsHookExW(WH_CBT, Some(menu_dark_cbt_proc), 0, GetCurrentThreadId());
-    let cmd = TrackPopupMenu(
-        menu,
-        TPM_RIGHTBUTTON | TPM_RETURNCMD,
-        pt.x, pt.y, 0, hwnd, std::ptr::null(),
-    );
-    if hook != 0 {
-        UnhookWindowsHookEx(hook);
+    let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut minfo: MONITORINFO = std::mem::zeroed();
+    minfo.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(mon, &mut minfo);
+    let mut x = pt.x;
+    let mut ypos = pt.y;
+    if x + menu_w > minfo.rcWork.right {
+        x = minfo.rcWork.right - menu_w;
     }
-    set_preferred_app_mode(1); // 恢复 AllowDark
-    flush_menu_themes();
-    DestroyMenu(menu);
-    DeleteObject(menu_brush);
-    // 清理快照，避免潜在的下一次访问读到过期数据
-    MENU_ITEMS.lock().unwrap().clear();
+    if ypos + menu_h > minfo.rcWork.bottom {
+        ypos = minfo.rcWork.bottom - menu_h;
+    }
+    if x < minfo.rcWork.left {
+        x = minfo.rcWork.left;
+    }
+    if ypos < minfo.rcWork.top {
+        ypos = minfo.rcWork.top;
+    }
 
-    if cmd != 0 {
-        handle_menu_cmd(hwnd, cmd as u32);
+    *MENU_ITEM_RECTS.lock().unwrap() = rects;
+    MENU_HOVER.store(-1, Ordering::Relaxed);
+    MENU_OWNER.store(hwnd, Ordering::Relaxed);
+
+    // ---- 注册窗口类(一次)并弹出无边框窗口 ----
+    if !MENU_CLASS_OK.load(Ordering::Relaxed) {
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.style = CS_DROPSHADOW; // 系统菜单同款投影
+        wc.lpfnWndProc = Some(menu_popup_proc);
+        wc.hInstance = GetModuleHandleW(std::ptr::null());
+        wc.hCursor = LoadCursorW(0, IDC_ARROW);
+        wc.lpszClassName = menu_class_name().as_ptr();
+        RegisterClassW(&wc);
+        MENU_CLASS_OK.store(true, Ordering::Relaxed);
     }
+    const EMPTY_TITLE: [u16; 1] = [0];
+    let menu_hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // 置顶、不进任务栏/Alt-Tab
+        menu_class_name().as_ptr(),
+        EMPTY_TITLE.as_ptr(),
+        WS_POPUP, // 无边框
+        x, ypos, menu_w, menu_h,
+        0, 0,
+        GetModuleHandleW(std::ptr::null()),
+        std::ptr::null(),
+    );
+    if menu_hwnd == 0 {
+        MENU_ITEMS.lock().unwrap().clear();
+        return;
+    }
+    // Win11：圆角(旧系统调用失败忽略)；投影由 CS_DROPSHADOW 提供
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    let round: u32 = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(
+        menu_hwnd,
+        33, // DWMWA_WINDOW_CORNER_PREFERENCE
+        &round as *const u32 as *const core::ffi::c_void,
+        4,
+    );
+
+    ShowWindow(menu_hwnd, SW_SHOWNORMAL);
+    SetForegroundWindow(menu_hwnd);
+    SetFocus(menu_hwnd); // 拿到焦点：点击外部(KILLFOCUS)关闭 + 支持键盘
 }
 
 /// 处理 WM_MEASUREITEM：返回每条菜单项的尺寸。
