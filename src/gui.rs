@@ -237,7 +237,7 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         y,
         s(290),
         s(24),
-        "  └ 开机时只在托盘后台运行（不弹主窗口）",
+        "开机时只在托盘后台运行（不弹主窗口）",
         start_minimized,
     );
     if !auto_start {
