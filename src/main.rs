@@ -1020,10 +1020,29 @@ unsafe fn save_schedule_time_from_edits(hwnd: HWND) {
     }
     let s1 = String::from_utf16_lossy(&buf1[..n1 as usize]);
     let s2 = String::from_utf16_lossy(&buf2[..n2 as usize]);
+    // 规范化：全角标点/数字 → 半角，"2000" → "20:00"
+    let norm = |s: &str| -> String {
+        let s: String = s
+            .trim()
+            .chars()
+            .map(|c| match c {
+                // 全角冒号 → 半角
+                '：' | '︓' => ':',
+                // 全角数字 → 半角
+                '０'..='９' => (c as u32 - '０' as u32 + '0' as u32) as u8 as char,
+                _ => c,
+            })
+            .collect();
+        if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+            format!("{}:{}", &s[0..2], &s[2..4])
+        } else {
+            s
+        }
+    };
     if let Some(s) = APP_STATE.get() {
         let mut st = s.lock().unwrap();
-        st.cfg.light_time = s1.trim().to_string();
-        st.cfg.dark_time = s2.trim().to_string();
+        st.cfg.light_time = norm(&s1);
+        st.cfg.dark_time = norm(&s2);
         let _ = config::save(&st.cfg);
         log(&format!(
             "时间已保存：浅色 {} 深色 {}",
@@ -2098,7 +2117,22 @@ fn write_coords_cache(c: (f64, f64)) -> anyhow::Result<()> {
 }
 
 fn parse_hm(s: &str) -> anyhow::Result<NaiveTime> {
-    NaiveTime::parse_from_str(s.trim(), "%H:%M").map_err(|e| anyhow!(e.to_string()))
+    // 全角标点/数字 → 半角，再兼容无冒号输入
+    let s: String = s
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '：' | '︓' => ':',
+            '０'..='９' => (c as u32 - '０' as u32 + '0' as u32) as u8 as char,
+            _ => c,
+        })
+        .collect();
+    let formatted = if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}:{}", &s[0..2], &s[2..4])
+    } else {
+        s
+    };
+    NaiveTime::parse_from_str(&formatted, "%H:%M").map_err(|e| anyhow!(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

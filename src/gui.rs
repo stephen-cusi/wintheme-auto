@@ -24,7 +24,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::SystemServices::{SS_ICON, SS_LEFT};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetDlgItem, SetWindowTextW, ES_AUTOHSCROLL, ES_NUMBER,
+    CreateWindowExW, GetDlgItem, SetWindowTextW, ES_AUTOHSCROLL,
     WM_SETFONT,
 };
 use crate::theme;
@@ -454,8 +454,7 @@ unsafe fn make_edit(
     let s = raw::WS_CHILD
         | raw::WS_VISIBLE
         | raw::WS_TABSTOP
-        | ES_AUTOHSCROLL as u32
-        | ES_NUMBER as u32;
+        | ES_AUTOHSCROLL as u32;
     let h = CreateWindowExW(
         0, // 不用 WS_EX_CLIENTEDGE：避免深色模式下出现白色 3D 凹陷边框
         w("EDIT").as_ptr(),
@@ -715,10 +714,27 @@ fn next_action_sun(now: NaiveTime, st: &sun::SunTimes) -> String {
 }
 
 fn next_action_schedule(now: NaiveTime, cfg: &Config) -> String {
-    let Ok(light) = NaiveTime::parse_from_str(&cfg.light_time, "%H:%M") else {
+    // 兼容全角标点/数字 + "HHMM"（无冒号）和 "HH:MM"（有冒号）两种格式
+    let norm = |s: &str| -> String {
+        let s: String = s
+            .trim()
+            .chars()
+            .map(|c| match c {
+                '：' | '︓' => ':',
+                '０'..='９' => (c as u32 - '０' as u32 + '0' as u32) as u8 as char,
+                _ => c,
+            })
+            .collect();
+        if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+            format!("{}:{}", &s[0..2], &s[2..4])
+        } else {
+            s
+        }
+    };
+    let Ok(light) = NaiveTime::parse_from_str(&norm(&cfg.light_time), "%H:%M") else {
         return "下一动作：时间格式错误（light_time）".into();
     };
-    let Ok(dark) = NaiveTime::parse_from_str(&cfg.dark_time, "%H:%M") else {
+    let Ok(dark) = NaiveTime::parse_from_str(&norm(&cfg.dark_time), "%H:%M") else {
         return "下一动作：时间格式错误（dark_time）".into();
     };
     let desired = if light <= dark {
