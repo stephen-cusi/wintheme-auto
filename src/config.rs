@@ -28,6 +28,8 @@ pub struct Config {
     pub start_minimized: bool,
     /// 是否显示系统托盘图标与菜单
     pub tray: bool,
+    /// 切深色主题时连带开启系统夜间模式（Night Light），切浅色时关闭
+    pub night_light: bool,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             // 用户需要开机就看到主窗口时，可在主窗口的「开机自启」下方关掉。
             start_minimized: true,
             tray: true,
+            night_light: false,
         }
     }
 }

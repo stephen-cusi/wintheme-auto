@@ -50,6 +50,7 @@ pub const ID_BTN_SAVE_TIME: u32 = 4003;
 
 pub const ID_CHK_AUTOSTART: u32 = 5001;
 pub const ID_CHK_START_MINIMIZED: u32 = 5002;
+pub const ID_CHK_NIGHT_LIGHT: u32 = 5005;
 pub const ID_BTN_ABOUT: u32 = 5003;
 /// 主窗口上"打开系统位置设置"按钮——直跳 Windows 设置的位置页
 pub const ID_BTN_OPEN_LOCATION_SETTINGS: u32 = 5004;
@@ -58,7 +59,7 @@ pub const ID_BTN_OPEN_LOCATION_SETTINGS: u32 = 5004;
 pub const BASE_W: i32 = 480;
 // 高度需容纳：头部 + 3 行状态 + 自启 + 静默 + 「打开位置设置」按钮（条件显示） +
 // 时间 + 提示 + 3 行按钮 + 边距。给「打开位置设置」按钮留出 ~30px 备用空间。
-pub const BASE_H: i32 = 550;
+pub const BASE_H: i32 = 580;
 
 // 常用 raw u32 window style（避免与 windows-sys 的 NewType 混用）
 mod raw {
@@ -247,6 +248,25 @@ pub unsafe fn populate_main_window(parent: HWND, hinst: HINSTANCE) {
         ShowWindow(start_minimized_h, 0);
     }
     y += s(30);
+
+    // ---- 夜间模式复选框 ----
+    let night_light = APP_STATE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|st| st.cfg.night_light)
+        .unwrap_or(false);
+    make_checkbox(
+        parent,
+        hinst,
+        ID_CHK_NIGHT_LIGHT,
+        mx,
+        y,
+        s(340),
+        s(24),
+        "切深色时连带开启系统夜间模式（Night Light）",
+        night_light,
+    );
+    y += s(28);
 
     // ---- 「打开系统位置设置」按钮：仅当 LocationStatus=Disabled 时显示 ----
     // 让用户一眼能跳到设置页，不用自己去找「设置 → 隐私和安全性 → 位置」
@@ -624,6 +644,14 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
         // ShowWindow: 0 = SW_HIDE, 5 = SW_SHOW
         let cmd = if cfg.auto_start { 5 } else { 0 };
         ShowWindow(h, cmd);
+    }
+
+    // 夜间模式复选框
+    if let Some(h) = hwnd_opt(hwnd, ID_CHK_NIGHT_LIGHT) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        const BM_SETCHECK: u32 = 0x00F1;
+        let w: usize = if cfg.night_light { 1 } else { 0 };
+        SendMessageW(h, BM_SETCHECK, w, 0);
     }
 
     // 时间编辑框（仅 schedule 模式启用）

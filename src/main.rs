@@ -7,6 +7,7 @@ mod config;
 mod geo;
 mod gui;
 mod icon;
+mod nightlight;
 mod sun;
 mod theme;
 
@@ -144,6 +145,7 @@ fn main() -> anyhow::Result<()> {
     // 启动时把配置同步到自绘复选框状态
     CHK_AUTOSTART.store(cfg.auto_start, Ordering::Relaxed);
     CHK_START_MINIMIZED.store(cfg.start_minimized, Ordering::Relaxed);
+    CHK_NIGHT_LIGHT.store(cfg.night_light, Ordering::Relaxed);
     if cfg.auto_start {
         // 写注册表时带上 --silent 标志，登录后程序在托盘里静默常驻，不弹主窗口。
         // (用户想"开机就看到主窗口"的话，可以在主窗口的"开机自启"下方关掉 start_minimized。)
@@ -373,6 +375,7 @@ unsafe extern "system" fn wnd_proc(
                 draw_menu_item(lparam)
             } else if dis.CtlID == gui::ID_CHK_AUTOSTART
                 || dis.CtlID == gui::ID_CHK_START_MINIMIZED
+                || dis.CtlID == gui::ID_CHK_NIGHT_LIGHT
             {
                 draw_owner_checkbox(dis)
             } else {
@@ -525,6 +528,12 @@ unsafe extern "system" fn wnd_proc(
                         on_start_minimized_clicked(hwnd);
                     }
                 }
+                gui::ID_CHK_NIGHT_LIGHT => {
+                    if ((_wparam >> 16) as u32) == 0 {
+                        toggle_checkbox(hwnd, gui::ID_CHK_NIGHT_LIGHT);
+                        on_night_light_clicked();
+                    }
+                }
                 _ => {}
             }
             0
@@ -573,6 +582,7 @@ static SUB_ANIM_FRAME: AtomicUsize = AtomicUsize::new(SUB_ANIM_FRAMES);
 // 启动时从 cfg 同步；点击时由 toggle_checkbox 翻转，同时写回 cfg(start_auto / start_minimized)。
 static CHK_AUTOSTART: AtomicBool = AtomicBool::new(true);
 static CHK_START_MINIMIZED: AtomicBool = AtomicBool::new(true);
+static CHK_NIGHT_LIGHT: AtomicBool = AtomicBool::new(false);
 
 // ---- 界面配色：由应用自己的主题判断(is_dark)决定，深浅色各一套，保证可读且一致 ----
 const BG_LIGHT: u32 = 0x00F2F2F2; // 浅色窗口背景
@@ -1391,6 +1401,7 @@ fn chk_state(id: u32) -> bool {
     match id {
         gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.load(Ordering::Relaxed),
         gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.load(Ordering::Relaxed),
+        gui::ID_CHK_NIGHT_LIGHT => CHK_NIGHT_LIGHT.load(Ordering::Relaxed),
         _ => false,
     }
 }
@@ -1404,6 +1415,7 @@ unsafe fn toggle_checkbox(hwnd: HWND, id: u32) {
     match id {
         gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.store(new, Ordering::Relaxed),
         gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.store(new, Ordering::Relaxed),
+        gui::ID_CHK_NIGHT_LIGHT => CHK_NIGHT_LIGHT.store(new, Ordering::Relaxed),
         _ => {}
     }
     let h = GetDlgItem(hwnd, id as i32);
@@ -1465,6 +1477,23 @@ unsafe fn on_start_minimized_clicked(_hwnd: HWND) {
             let _ = config::install_startup(&exe, on);
         }
         log(&format!("开机静默启动 = {}(已持久化)", on));
+    }
+}
+
+/// 夜间模式复选框被点击
+fn on_night_light_clicked() {
+    let on = chk_state(gui::ID_CHK_NIGHT_LIGHT);
+    if let Some(s) = APP_STATE.get() {
+        let mut st = s.lock().unwrap();
+        st.cfg.night_light = on;
+        let _ = config::save(&st.cfg);
+        // 如果当前是深色主题，立即同步
+        if on && theme::get_theme().ok() == Some(Theme::Dark) {
+            let _ = nightlight::set_enabled(true);
+        } else if !on {
+            let _ = nightlight::set_enabled(false);
+        }
+        log(&format!("夜间模式联动 = {}", on));
     }
 }
 
@@ -1788,21 +1817,21 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
         ID_LIGHT => {
             mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Light);
+            sync_night_light(&s.cfg, Theme::Light);
             log("手动切换到浅色");
         }
         ID_DARK => {
             mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Dark);
+            sync_night_light(&s.cfg, Theme::Dark);
             log("手动切换到深色");
         }
         ID_TOGGLE => {
             mark_manual_override(&mut *s);
             if let Ok(cur) = theme::get_theme() {
-                let _ = theme::set_theme(if cur == Theme::Light {
-                    Theme::Dark
-                } else {
-                    Theme::Light
-                });
+                let new = if cur == Theme::Light { Theme::Dark } else { Theme::Light };
+                let _ = theme::set_theme(new);
+                sync_night_light(&s.cfg, new);
             }
         }
         ID_MODE_SUN => {
@@ -1974,8 +2003,18 @@ fn tick(state: &mut AppState) -> anyhow::Result<()> {
     if current != desired {
         theme::set_theme(desired)?;
         log(&format!("主题已切换为 {:?}", desired));
+        sync_night_light(&state.cfg, desired);
     }
     Ok(())
+}
+
+fn sync_night_light(cfg: &Config, theme: Theme) {
+    if !cfg.night_light { return; }
+    if theme == Theme::Dark {
+        let _ = nightlight::set_enabled(true);
+    } else {
+        let _ = nightlight::set_enabled(false);
+    }
 }
 
 fn evaluate(state: &mut AppState) -> anyhow::Result<Theme> {
