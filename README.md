@@ -28,6 +28,7 @@
 - **暂停模式**：`off` 模式下不动主题，仅保留托盘手动控制。
 - **开机启动**：主界面「开机自动启动」勾选框，直接写/移除 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册表项（无需管理员）。
 - **开机静默常驻**：「开机时只在托盘后台运行（不弹主窗口）」子选项，随开机自启开关联动显隐。
+- **夜间模式联动**：勾选后，切换深色主题时自动开启系统 Night Light（护眼模式），切换浅色时自动关闭。通过直接操作 CloudStore 注册表二进制数据实现。
 - **系统托盘**：右键菜单切换深浅色/模式、立即刷新位置、打开配置、退出（自绘大号菜单，勾选/悬停高亮）；
   左键单击反转当前主题；任务栏提示显示当前模式与主题。
 - **深浅色自适应界面**：窗口背景/文字/输入框/勾选框/按钮随当前主题自动切换，标题栏同步变深/变浅，
@@ -65,6 +66,7 @@ check_interval_secs = 60
 auto_start = true       # 是否写开机启动注册表
 start_minimized = true  # 开机自启时静默进托盘，不弹主窗口
 tray = true             # 是否显示托盘图标
+night_light = false     # 切深色时连带开启系统夜间模式（Night Light）
 ```
 > 注意：TOML 没有 `null` 值。想"自动按系统位置获取"，直接把 `latitude`/`longitude` 两行**省略**即可（程序会取默认值并自动定位），不要写成 `latitude = null`——那样会导致配置解析失败。
 
@@ -107,6 +109,8 @@ tray = true             # 是否显示托盘图标
 - 日出日落使用 NOAA「Almanac for Computers」算法，输入日期、经纬度、时区偏移，输出当地日出/日落时刻。
 - 深色自适应通过 uxtheme 的 `SetPreferredAppMode(AllowDark)`（未公开 API，失败则静默保持现状）+
   `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)` 让窗口/标题栏跟随主题。
+- 夜间模式通过直接读写 `HKCU\...\CloudStore\...\bluelightreductionstate` 注册表二进制数据（社区逆向格式），
+  修改 byte 18（0x15=开/0x13=关）并插入/删除 bytes 23-24，自增 bytes 10-14 计数器让系统感知变更。
 
 ## Vibe Coding
 
