@@ -448,7 +448,8 @@ unsafe extern "system" fn wnd_proc(
                         // 主窗口模式：左键 = 显示/隐藏主窗口
                         show_or_toggle_main_window(hwnd);
                     } else {
-                        handle_menu_cmd(hwnd, ID_TOGGLE);
+                        // 仅托盘模式：左键 = 打开菜单（和右键一样）
+                        show_menu(hwnd);
                     }
                 }
                 WM_RBUTTONUP => show_menu(hwnd),
