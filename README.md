@@ -5,9 +5,6 @@
 用 Rust 编写，纯 Win32 API，**零额外运行时依赖**。在 Windows 10/11 上跟随日出日落或定时切换浅色/深色主题，
 支持系统托盘常驻、登录自启。界面会**跟随当前主题自动切换深浅色**（标题栏、背景、文字、输入框、勾选框、自绘按钮）。
 
-> 😮‍💨 本项目由 **vibe coding**（AI 辅助结对编程）驱动开发——Rust/Win32 细节密集、容易踩坑，
-> 全部代码在对话式迭代中写出、编译、调优而成。详见文末 **Vibe Coding** 一栏。
-
 ## 系统要求 / 兼容性
 
 - **Windows 11**（推荐，Build 22000+）：标题栏深色用官方 `DWMWA_USE_IMMERSIVE_DARK_MODE=20`，全部特性完整可用。
@@ -111,12 +108,6 @@ night_light = false     # 切深色时连带开启系统夜间模式（Night Lig
   `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)` 让窗口/标题栏跟随主题。
 - 夜间模式通过直接读写 `HKCU\...\CloudStore\...\bluelightreductionstate` 注册表二进制数据（社区逆向格式），
   修改 byte 18（0x15=开/0x13=关）并插入/删除 bytes 23-24，自增 bytes 10-14 计数器让系统感知变更。
-
-## Vibe Coding
-
-本项目全程采用 **vibe coding**（AI 结对编程）方式开发：以自然语言描述需求与 UI 效果，
-由 AI 生成、迭代、修复 Rust/Win32 代码，作者负责在 Windows 上编译验证、提供截图与反馈，
-最终打磨出可用的桌面应用。所有 UI 细节（深浅色适配、自绘控件、托盘菜单、关于窗口）均在此过程中收敛。
 
 ## 许可证
 
