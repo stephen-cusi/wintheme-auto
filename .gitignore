@@ -16,6 +16,6 @@ scripts/inspect_api.py
 # 本仓库开发/维护注意事项（本地维护，不上传）
 AGENTS.md
 
-# 第三方库（本地 path 依赖）
+# 第三方库（path 依赖，本地开发用，不提交）
 win32_notif/
 win32_notif-master.zip

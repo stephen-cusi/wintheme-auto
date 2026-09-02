@@ -35,7 +35,7 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
-win32_notif = { path = "win32_notif" }
+win32_notif = { git = "https://github.com/ahqsoftorg/win32_notif.git", branch = "master" }
 
 [build-dependencies]
 winres = "0.1"
