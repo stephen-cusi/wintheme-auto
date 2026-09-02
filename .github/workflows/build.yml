@@ -74,6 +74,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Get short commit hash
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -84,14 +92,12 @@ jobs:
         with:
           tag_name: rolling
           name: WinTheme Auto (rolling)
-          # v3 已在 tag 存在时自动更新该 release；overwrite_files 确保替换同名产物
           overwrite_files: true
           prerelease: true
           files: dist/*.exe
           body: |
             Rolling build from `main`.
 
-            Commit: `${{ github.sha }}`
-            ${{ github.event.head_commit.message }}
+            Commit: ${{ steps.sha.outputs.short }}
 
             Binaries: x64 and ARM64 (attached `.exe` files).
