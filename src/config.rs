@@ -30,6 +30,8 @@ pub struct Config {
     pub tray: bool,
     /// 切深色主题时连带开启系统夜间模式（Night Light），切浅色时关闭
     pub night_light: bool,
+    /// 切换主题时是否弹出 Windows 原生通知
+    pub notifications: bool,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             start_minimized: true,
             tray: true,
             night_light: false,
+            notifications: true,
         }
     }
 }

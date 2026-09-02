@@ -8,6 +8,7 @@ mod geo;
 mod gui;
 mod icon;
 mod nightlight;
+mod notify;
 mod sun;
 mod theme;
 
@@ -142,10 +143,13 @@ fn main() -> anyhow::Result<()> {
     let silent = args.iter().any(|a| a == "--silent");
 
     let cfg = config::load()?;
+    // 初始化通知器（静态存储，避免锁冲突）
+    let _ = NOTIFIER.set(notify::init());
     // 启动时把配置同步到自绘复选框状态
     CHK_AUTOSTART.store(cfg.auto_start, Ordering::Relaxed);
     CHK_START_MINIMIZED.store(cfg.start_minimized, Ordering::Relaxed);
     CHK_NIGHT_LIGHT.store(cfg.night_light, Ordering::Relaxed);
+    CHK_NOTIFICATIONS.store(cfg.notifications, Ordering::Relaxed);
     if cfg.auto_start {
         // 写注册表时带上 --silent 标志，登录后程序在托盘里静默常驻，不弹主窗口。
         // (用户想"开机就看到主窗口"的话，可以在主窗口的"开机自启"下方关掉 start_minimized。)
@@ -229,7 +233,7 @@ fn run_event_loop() -> anyhow::Result<()> {
     unsafe {
         let hinst = GetModuleHandleW(ptr::null());
         let class_name = widestring("WinthemeAutoClass");
-        let title = widestring("WinTheme Auto");
+        let title = widestring(&format!("WinTheme Auto v{}-{}", env!("CARGO_PKG_VERSION"), build_commit()));
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wnd_proc);
         wc.hInstance = hinst;
@@ -376,6 +380,7 @@ unsafe extern "system" fn wnd_proc(
             } else if dis.CtlID == gui::ID_CHK_AUTOSTART
                 || dis.CtlID == gui::ID_CHK_START_MINIMIZED
                 || dis.CtlID == gui::ID_CHK_NIGHT_LIGHT
+                || dis.CtlID == gui::ID_CHK_NOTIFICATIONS
             {
                 draw_owner_checkbox(dis)
             } else {
@@ -535,6 +540,12 @@ unsafe extern "system" fn wnd_proc(
                         on_night_light_clicked();
                     }
                 }
+                gui::ID_CHK_NOTIFICATIONS => {
+                    if ((_wparam >> 16) as u32) == 0 {
+                        toggle_checkbox(hwnd, gui::ID_CHK_NOTIFICATIONS);
+                        on_notifications_clicked();
+                    }
+                }
                 _ => {}
             }
             0
@@ -566,6 +577,7 @@ unsafe extern "system" fn wnd_proc(
 // ---- 主窗口辅助 ----
 
 static IS_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
+static NOTIFIER: OnceLock<Option<notify::ToastsNotifier>> = OnceLock::new();
 const GWLP_USERDATA: i32 = -21;
 
 /// 定时检查(主题/日出日落)的计时器 id
@@ -584,6 +596,7 @@ static SUB_ANIM_FRAME: AtomicUsize = AtomicUsize::new(SUB_ANIM_FRAMES);
 static CHK_AUTOSTART: AtomicBool = AtomicBool::new(true);
 static CHK_START_MINIMIZED: AtomicBool = AtomicBool::new(true);
 static CHK_NIGHT_LIGHT: AtomicBool = AtomicBool::new(false);
+static CHK_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
 
 // ---- 界面配色：由应用自己的主题判断(is_dark)决定，深浅色各一套，保证可读且一致 ----
 const BG_LIGHT: u32 = 0x00F2F2F2; // 浅色窗口背景
@@ -1290,8 +1303,9 @@ unsafe fn paint_about(hwnd: HWND) {
     let scale = gui::dpi_scale_for_window(hwnd);
     let old_font = SelectObject(hdc, gui::ui_font(scale));
     let version = env!("CARGO_PKG_VERSION");
+    let commit = build_commit();
     // 文字：先居中标题("WinTheme Auto")，再列各字段
-    let title_w = widestring(&format!("WinTheme Auto v{version}"));
+    let title_w = widestring(&format!("WinTheme Auto v{version}-{commit}"));
     let mut title_rc = rc;
     title_rc.left += (16.0 * scale) as i32;
     title_rc.right -= (16.0 * scale) as i32;
@@ -1403,6 +1417,7 @@ fn chk_state(id: u32) -> bool {
         gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.load(Ordering::Relaxed),
         gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.load(Ordering::Relaxed),
         gui::ID_CHK_NIGHT_LIGHT => CHK_NIGHT_LIGHT.load(Ordering::Relaxed),
+        gui::ID_CHK_NOTIFICATIONS => CHK_NOTIFICATIONS.load(Ordering::Relaxed),
         _ => false,
     }
 }
@@ -1417,6 +1432,7 @@ unsafe fn toggle_checkbox(hwnd: HWND, id: u32) {
         gui::ID_CHK_AUTOSTART => CHK_AUTOSTART.store(new, Ordering::Relaxed),
         gui::ID_CHK_START_MINIMIZED => CHK_START_MINIMIZED.store(new, Ordering::Relaxed),
         gui::ID_CHK_NIGHT_LIGHT => CHK_NIGHT_LIGHT.store(new, Ordering::Relaxed),
+        gui::ID_CHK_NOTIFICATIONS => CHK_NOTIFICATIONS.store(new, Ordering::Relaxed),
         _ => {}
     }
     let h = GetDlgItem(hwnd, id as i32);
@@ -1497,6 +1513,41 @@ fn on_night_light_clicked() {
         log(&format!("夜间模式联动 = {}", on));
     }
 }
+
+/// 通知复选框被点击
+fn on_notifications_clicked() {
+    let on = chk_state(gui::ID_CHK_NOTIFICATIONS);
+    if let Some(s) = APP_STATE.get() {
+        let mut st = s.lock().unwrap();
+        st.cfg.notifications = on;
+        let _ = config::save(&st.cfg);
+        log(&format!("通知 = {}", on));
+    }
+}
+
+/// 切换主题时的反馈：任务栏闪烁 + Toast 通知
+
+fn notify_theme_changed(hwnd: HWND, is_dark: bool) {
+    let enabled = chk_state(gui::ID_CHK_NOTIFICATIONS);
+    log(&format!("notify: is_dark={} enabled={} notifier={}", is_dark, enabled, NOTIFIER.get().is_some()));
+    if !enabled { return; }
+    let label = if is_dark { "已切换到深色模式" } else { "已切换到浅色模式" };
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL};
+        let mut fwi: FLASHWINFO = std::mem::zeroed();
+        fwi.cbSize = std::mem::size_of::<FLASHWINFO>() as u32;
+        fwi.hwnd = hwnd;
+        fwi.dwFlags = FLASHW_ALL;
+        fwi.uCount = 3;
+        fwi.dwTimeout = 0;
+        FlashWindowEx(&fwi);
+    }
+    if let Some(Some(n)) = NOTIFIER.get() {
+        notify::show_raw(n, "WinTheme Auto", label);
+    }
+    log(label);
+}
+
 
 /// 主窗口的"刷新"按钮：丢弃已缓存的位置(内存 + 磁盘)+ 重新读系统时区 +
 /// 强制走一次系统位置 API + 立即按新坐标 tick。
@@ -1644,6 +1695,7 @@ unsafe fn show_menu(hwnd: HWND) {
     DestroyMenu(menu);
     if cmd != 0 {
         handle_menu_cmd(hwnd, cmd as u32);
+        refresh_ui(hwnd); // 托盘菜单操作后刷新主窗口
     }
 }
 
@@ -1819,12 +1871,14 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
             mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Light);
             sync_night_light(&s.cfg, Theme::Light);
+            notify_theme_changed(hwnd, false);
             log("手动切换到浅色");
         }
         ID_DARK => {
             mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Dark);
             sync_night_light(&s.cfg, Theme::Dark);
+            notify_theme_changed(hwnd, true);
             log("手动切换到深色");
         }
         ID_TOGGLE => {
@@ -1833,6 +1887,8 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
                 let new = if cur == Theme::Light { Theme::Dark } else { Theme::Light };
                 let _ = theme::set_theme(new);
                 sync_night_light(&s.cfg, new);
+                notify_theme_changed(hwnd, new == Theme::Dark);
+                log(if new == Theme::Dark { "手动切换到深色" } else { "手动切换到浅色" });
             }
         }
         ID_MODE_SUN => {
@@ -2003,6 +2059,9 @@ fn tick(state: &mut AppState) -> anyhow::Result<()> {
     let current = theme::get_theme().unwrap_or(desired);
     if current != desired {
         theme::set_theme(desired)?;
+        if let Some(h) = state.tray_hwnd {
+            notify_theme_changed(h, desired == Theme::Dark);
+        }
         log(&format!("主题已切换为 {:?}", desired));
         sync_night_light(&state.cfg, desired);
     }
