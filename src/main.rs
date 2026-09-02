@@ -45,7 +45,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, DispatchMessageW,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT,
-    WM_TIMER, WNDCLASSW, HWND_MESSAGE, IDC_HAND,
+    WM_TIMER, WNDCLASSW, IDC_HAND,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, TrackMouseEvent,
@@ -221,7 +221,7 @@ fn run_gui() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// 主循环：仅托盘模式(旧行为)-- HWND_MESSAGE 隐藏窗口 + 系统托盘
+// 主循环：仅托盘模式-- 隐藏主窗口 + 系统托盘(左键点击托盘可随时打开主窗口)
 // ---------------------------------------------------------------------------
 
 fn run_tray_only() -> anyhow::Result<()> {
@@ -243,35 +243,20 @@ fn run_event_loop() -> anyhow::Result<()> {
         if RegisterClassW(&wc) == 0 {
             log("RegisterClassW 失败");
         }
-        let is_main = IS_MAIN_WINDOW.load(Ordering::Relaxed);
-        // 主窗口：OVERLAPPEDWINDOW 风格(标题栏/系统菜单/最小化按钮)+ 可见
-        // 仅托盘：HWND_MESSAGE 隐藏窗口
-        let (style, ex_style, parent, w, h) = if is_main {
-            let style_bits: u32 = 0x00C00000 // WS_OVERLAPPED | WS_CAPTION
-                | 0x00080000  // WS_SYSMENU
-                | 0x00020000  // WS_MINIMIZEBOX
-                | 0x02000000  // WS_CLIPCHILDREN
-                | 0x04000000  // WS_CLIPSIBLINGS
-                | 0x10000000; // WS_VISIBLE
-            let k = gui::dpi_scale_for_system();
-            let win_w = (gui::BASE_W as f64 * k).round() as i32;
-            let win_h = (gui::BASE_H as f64 * k).round() as i32;
-            (
-                style_bits,
-                0x00040000, // WS_EX_APPWINDOW
-                0,          // 无父窗口(HWND 是 isize，空句柄传 0)
-                win_w,
-                win_h,
-            )
-        } else {
-            (
-                0,
-                0,
-                HWND_MESSAGE,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-            )
-        };
+        // 始终创建真正的窗口：托盘模式只是不加 WS_VISIBLE（隐藏），
+        // 这样左键点击托盘时可以直接 ShowWindow 显示主窗口。
+        // （旧实现用 HWND_MESSAGE 导致托盘模式永远无法打开主界面）
+        let k = gui::dpi_scale_for_system();
+        let win_w = (gui::BASE_W as f64 * k).round() as i32;
+        let win_h = (gui::BASE_H as f64 * k).round() as i32;
+        let style: u32 = 0x00C00000 // WS_OVERLAPPED | WS_CAPTION
+            | 0x00080000  // WS_SYSMENU
+            | 0x00020000  // WS_MINIMIZEBOX
+            | 0x02000000  // WS_CLIPCHILDREN
+            | 0x04000000  // WS_CLIPSIBLINGS
+            | if IS_MAIN_WINDOW.load(Ordering::Relaxed) { 0x10000000 } else { 0 }; // WS_VISIBLE 仅 GUI 模式
+        let ex_style: u32 = if IS_MAIN_WINDOW.load(Ordering::Relaxed) { 0x00040000 } else { 0 }; // WS_EX_APPWINDOW 仅 GUI 模式
+        let (style, ex_style, parent, w, h) = (style, ex_style, 0isize, win_w, win_h);
         let hwnd = CreateWindowExW(
             ex_style,
             class_name.as_ptr(),
@@ -321,12 +306,11 @@ unsafe extern "system" fn wnd_proc(
                 .map(|s| s.lock().unwrap().cfg.check_interval_secs)
                 .unwrap_or(60);
             SetTimer(hwnd, TIMER_MAIN, ((secs * 1000).max(1000)) as u32, None);
-            // 主窗口模式：在已创建的主窗口上填充 GUI 控件
-            if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+            // 始终填充 GUI 控件（托盘模式也创建了真正的窗口，只是隐藏的）
+            {
                 let hinst = GetModuleHandleW(ptr::null());
                 allow_dark_window(hwnd, true);
                 gui::populate_main_window(hwnd, hinst);
-                // 设置标题栏 / 任务栏图标(用我们自定义的 .ico，而非默认图标)
                 apply_app_icon(hwnd);
             }
             if let Some(s) = APP_STATE.get() {
@@ -449,13 +433,8 @@ unsafe extern "system" fn wnd_proc(
             let event = lparam as u32;
             match event {
                 WM_LBUTTONUP => {
-                    if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
-                        // 主窗口模式：左键 = 显示/隐藏主窗口
-                        show_or_toggle_main_window(hwnd);
-                    } else {
-                        // 仅托盘模式：左键 = 打开菜单（和右键一样）
-                        show_menu(hwnd);
-                    }
+                    // 左键点击托盘：始终显示/隐藏主窗口
+                    show_or_toggle_main_window(hwnd);
                 }
                 WM_RBUTTONUP => show_menu(hwnd),
                 _ => {}
@@ -560,7 +539,7 @@ unsafe extern "system" fn wnd_proc(
             // 清理：托盘 +字体
             let mut nid = nid_base(hwnd);
             Shell_NotifyIconW(NIM_DELETE, &mut nid);
-            if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+            {
                 use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
                 let font = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as isize;
                 if font != 0 {
@@ -993,7 +972,8 @@ unsafe fn flush_menu_themes() {
 /// 刷新 UI(托盘提示 + 主窗口)
 unsafe fn refresh_ui(hwnd: HWND) {
     update_tooltip(hwnd);
-    if IS_MAIN_WINDOW.load(Ordering::Relaxed) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    if IsWindowVisible(hwnd) != 0 {
         apply_titlebar_theme(hwnd);
         // 主题可能已切换：让旧的窗口/编辑刷子失效，下一次 WM_CTLCOLOR* 重建为当前主题颜色
         invalidate_theme_brushes();
