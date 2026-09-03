@@ -391,6 +391,7 @@ dependencies = [
 [[package]]
 name = "win32_notif"
 version = "0.15.3"
+source = "git+https://github.com/ahqsoftorg/win32_notif.git?branch=master#990d6b413a58592b0c880f003fe2a03a8f72eb17"
 dependencies = [
  "windows",
  "windows-core",

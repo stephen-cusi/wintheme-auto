@@ -15,7 +15,7 @@ mod theme;
 use anyhow::anyhow;
 use chrono::{Local, NaiveDate, NaiveTime};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, RECT, SIZE, WPARAM};
@@ -38,10 +38,12 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyMenu, DestroyWindow,
     AppendMenuW, CreatePopupMenu, EnumChildWindows,
-    GetClientRect, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetClientRect, GetClassNameW, GetCursorPos, GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
     IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MF_CHECKED, MF_OWNERDRAW,
-    MessageBoxW, MSG,
+    MessageBoxW, MSG, MENUINFO, MIM_APPLYTOSUBMENUS, MIM_BACKGROUND,
     PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetMenuInfo, SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx,
+    HCBT_CREATEWND, WH_CBT,
     SetTimer, ShowWindow, SW_HIDE, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, DispatchMessageW,
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT,
@@ -54,6 +56,8 @@ use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED,
     ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_BUTTON, ODT_MENU,
 };
+
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 use crate::config::Config;
 use crate::sun::SunTimes;
@@ -1620,6 +1624,61 @@ struct MenuItem {
 /// MENUITEMINFOW.dwItemData 存 index 进去(usize)，WM_DRAWITEM 时用 itemData 反查。
 static MENU_ITEMS: std::sync::Mutex<Vec<MenuItem>> = std::sync::Mutex::new(Vec::new());
 
+/// CBT 钩子抓到的托盘菜单 popup 窗口句柄(系统类名 "#32768")
+static MENU_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// CBT 钩子：TrackPopupMenu 弹出时系统会创建类名为 "#32768" 的菜单窗口，
+/// 这里只在创建瞬间(HCBT_CREATEWND)记录句柄；圆角的 DWM 设置由 show_menu 里
+/// 启动的辅助线程完成(创建瞬间 DWM 尚未接管窗口，直接调用会返回 E_HANDLE)。
+/// 其余钩子事件必须原样 CallNextHookEx 传递，否则菜单行为会异常。
+unsafe extern "system" fn menu_cbt_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HCBT_CREATEWND as i32 {
+        let hwnd = wparam as HWND;
+        let mut cls = [0u16; 8];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), 8) as usize;
+        const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38]; // "#32768"
+        if n >= 6 && cls[..6] == MENU_CLASS {
+            MENU_HWND.store(hwnd, Ordering::SeqCst);
+        }
+    }
+    CallNextHookEx(0, code, wparam, lparam)
+}
+
+/// 给菜单窗口设置 Win11 圆角。DWM 在菜单窗口刚创建(HCBT_CREATEWND)时还未接管它，
+/// 立即设置会返回 E_HANDLE，所以由辅助线程轮询重试，直到生效或窗口销毁。
+/// DwmSetWindowAttribute 可跨线程调用，与 GUI 线程的 TrackPopupMenu 模态循环互不干扰。
+unsafe fn apply_menu_rounding() {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    std::thread::spawn(|| {
+        let pref: i32 = DWMWCP_ROUND;
+        let attr_ptr = &pref as *const i32 as *const std::ffi::c_void;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let h = MENU_HWND.load(Ordering::SeqCst);
+            if h == 0 {
+                // 等钩子抓到菜单窗口
+                continue;
+            }
+            let hr = DwmSetWindowAttribute(
+                h as HWND,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                attr_ptr,
+                std::mem::size_of::<i32>() as u32,
+            );
+            if hr == ERROR_SUCCESS as i32 {
+                return;
+            }
+            // 窗口已销毁(菜单瞬间关闭)则放弃；否则继续重试
+            if hr != 0 && MENU_HWND.load(Ordering::SeqCst) != h {
+                return;
+            }
+        }
+    });
+}
+
 /// 弹出托盘菜单：原生 TrackPopupMenu 承担弹出/键盘/点击外部消散；
 /// 条目仍 owner-draw(由 wnd_proc 的 WM_MEASUREITEM/WM_DRAWITEM 自绘深浅色)。
 unsafe fn show_menu(hwnd: HWND) {
@@ -1659,6 +1718,31 @@ unsafe fn show_menu(hwnd: HWND) {
         }
     }
 
+    // 菜单窗口底色与条目同色：边缘/圆角露出的部分不再出现系统浅色底
+    let menu_bg: u32 = if is_dark() { 0x1F1F1F } else { 0xF2F2F2 };
+    let hbr_back = CreateSolidBrush(menu_bg);
+    let mi = MENUINFO {
+        cbSize: std::mem::size_of::<MENUINFO>() as u32,
+        fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+        dwStyle: 0,
+        cyMax: 0,
+        hbrBack: hbr_back,
+        dwContextHelpID: 0,
+        dwMenuData: 0,
+    };
+    SetMenuInfo(menu, &mi);
+
+    // 菜单边框由系统按 uxtheme 菜单主题绘制，AllowDark 只是"跟随系统"，
+    // app 深色+系统浅色时会画浅色边框(丑)。这里按 app 主题强制 ForceDark/ForceLight，
+    // 让边框与菜单同色；弹完恢复 AllowDark。FlushMenuThemes 立即生效。
+    set_preferred_app_mode(if is_dark() { 2 } else { 3 });
+    flush_menu_themes();
+
+    // CBT 钩子抓菜单窗口(#32768)设置 DWM 圆角；菜单关闭后卸钩并恢复主题模式
+    MENU_HWND.store(0, Ordering::SeqCst);
+    let hook = SetWindowsHookExW(WH_CBT, Some(menu_cbt_hook), 0, GetCurrentThreadId());
+    apply_menu_rounding();
+
     // 经典托盘菜单模式(KB135788)：先 SetForegroundWindow，TrackPopupMenu 才能在
     // 点击外部时消散；结束后补发 WM_NULL 修正焦点归属。
     SetForegroundWindow(hwnd);
@@ -1671,7 +1755,13 @@ unsafe fn show_menu(hwnd: HWND) {
         0, hwnd,
         std::ptr::null(),
     );
+    if hook != 0 {
+        UnhookWindowsHookEx(hook);
+    }
+    set_preferred_app_mode(1); // 恢复 AllowDark(跟随系统)
+    flush_menu_themes();
     PostMessageW(hwnd, 0x0000, 0, 0); // WM_NULL
+    DeleteObject(hbr_back);
     DestroyMenu(menu);
     if cmd != 0 {
         handle_menu_cmd(hwnd, cmd as u32);
