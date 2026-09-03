@@ -324,6 +324,13 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
             }
+            // WM_CREATE 时窗口尚未 ShowWindow，下面的 refresh_ui 会因
+            // IsWindowVisible==0 跳过标题栏、画刷和状态文本刷新，必须在这里补齐：
+            // 否则深色系统下首帧是"深色窗口体 + 白色标题栏"，且主题标签/模式/
+            // 位置行/时刻编辑框全为空，要等下一轮定时器才出现。
+            apply_titlebar_theme(hwnd);
+            invalidate_theme_brushes();
+            gui::refresh_main_window(hwnd);
             update_tooltip(hwnd);
             refresh_ui(hwnd);
             0
