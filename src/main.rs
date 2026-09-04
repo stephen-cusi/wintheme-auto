@@ -1943,7 +1943,8 @@ fn mark_manual_override(s: &mut AppState) {
 }
 
 unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
-    let mut s = APP_STATE.get().unwrap().lock().unwrap();    match id {
+    let mut s = APP_STATE.get().unwrap().lock().unwrap();
+    match id {
         ID_LIGHT => {
             mark_manual_override(&mut *s);
             let _ = theme::set_theme(Theme::Light);
@@ -2002,7 +2003,7 @@ unsafe fn handle_menu_cmd(hwnd: HWND, id: u32) {
             // 这样既不会让自定义子控件在销毁瞬间擦成白闪，也不会留下半透明残影。
             ShowWindow(hwnd, SW_HIDE);
             use windows_sys::Win32::Graphics::Dwm::DwmFlush;
-            unsafe { DwmFlush() };
+            DwmFlush();
             DestroyWindow(hwnd);
             return;
         }

@@ -31,7 +31,9 @@ fn logo_file_uri() -> &'static str {
         if std::fs::write(&path, LOGO_PNG).is_err() {
             crate::log("写入通知图标文件失败，appLogoOverride 将不可用");
         }
-        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+        // Windows 路径转 file:// URI：C:\path → file:///C:/path
+        let path_str = path.display().to_string().replace('\\', "/");
+        format!("file:///{}", path_str)
     })
 }
 

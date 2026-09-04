@@ -685,7 +685,8 @@ pub unsafe fn refresh_main_window(hwnd: HWND) {
     let light_h = GetDlgItem(hwnd, ID_EDIT_LIGHT as i32);
     let dark_h = GetDlgItem(hwnd, ID_EDIT_DARK as i32);
     let save_h = GetDlgItem(hwnd, ID_BTN_SAVE_TIME as i32);
-    let enable = mode == "schedule";    if light_h != 0 {
+    let enable = mode == "schedule";
+    if light_h != 0 {
         send_message_enable(light_h, enable);
         let s = w(&cfg.light_time);
         SetWindowTextW(light_h, s.as_ptr());
